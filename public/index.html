@@ -475,7 +475,7 @@ function HistoryPanel({ alert, onClose }) {
 
 // ── ChartCanvas ────────────────────────────────────────────────────────────
 
-function ChartCanvas({ type, labels, datasets, chartOptions }) {
+function ChartCanvas({ type, labels, datasets, chartOptions, height }) {
   const canvasRef = React.useRef(null);
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -491,7 +491,124 @@ function ChartCanvas({ type, labels, datasets, chartOptions }) {
     });
     return () => chart.destroy();
   }, []);
-  return <div style={{ height: 260 }}><canvas ref={canvasRef} /></div>;
+  return <div style={{ height: height || 260 }}><canvas ref={canvasRef} /></div>;
+}
+
+// ── TenantAlertsBreakdown ──────────────────────────────────────────────────
+
+function TenantAlertsBreakdown({ dates, tenants, byDateTenant }) {
+  const [selectedTenant, setSelectedTenant] = React.useState(null);
+
+  // Compute total alerts per tenant, sorted descending
+  const tenantTotals = tenants
+    .map(t => ({ tenant: t, total: dates.reduce((s, d) => s + (byDateTenant[d]?.[t] || 0), 0) }))
+    .sort((a, b) => b.total - a.total);
+
+  const MAX_SHOWN = 20;
+  const shown = tenantTotals.slice(0, MAX_SHOWN);
+
+  // Horizontal bar chart data
+  const barData = [{
+    label: 'Total Alerts',
+    data: shown.map(r => r.total),
+    backgroundColor: shown.map((_, i) => PALETTE[i % PALETTE.length] + 'cc'),
+    borderColor: shown.map((_, i) => PALETTE[i % PALETTE.length]),
+    borderWidth: 1,
+    borderRadius: 4,
+  }];
+
+  const barOptions = {
+    indexAxis: 'y',
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.x} alert${ctx.parsed.x !== 1 ? 's' : ''}` } },
+    },
+    scales: {
+      x: { beginAtZero: true, ticks: { stepSize: 1 }, grid: { color: '#f3f4f6' } },
+      y: { grid: { display: false }, ticks: { font: { size: 11 } } },
+    },
+    onClick: (_, elements) => {
+      if (!elements.length) return;
+      const idx = elements[0].index;
+      const t = shown[idx].tenant;
+      setSelectedTenant(prev => prev === t ? null : t);
+    },
+  };
+
+  const horizHeight = Math.max(180, shown.length * 28 + 40);
+
+  // Trend line for selected tenant
+  const trendDatasets = selectedTenant ? [{
+    label: selectedTenant,
+    data: dates.map(d => byDateTenant[d]?.[selectedTenant] || 0),
+    fill: true,
+    backgroundColor: 'rgba(59,130,246,0.10)',
+    borderColor: '#3b82f6',
+    borderWidth: 2,
+    tension: 0.35,
+    pointRadius: 4,
+    pointBackgroundColor: '#3b82f6',
+  }] : [];
+
+  return (
+    <div>
+      {/* Ranked bar */}
+      <div className="mb-1">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <p className="text-xs text-gray-400">
+              Click a bar to see its daily trend{tenantTotals.length > MAX_SHOWN ? ` · showing top ${MAX_SHOWN} of ${tenantTotals.length}` : ''}
+            </p>
+          </div>
+          {selectedTenant && (
+            <button
+              onClick={() => setSelectedTenant(null)}
+              className="text-xs text-blue-600 hover:text-blue-800 underline"
+            >
+              Clear selection
+            </button>
+          )}
+        </div>
+        <div style={{ height: horizHeight }}>
+          <ChartCanvas
+            key={`hbar-${shown.map(r=>r.tenant).join(',')}`}
+            type="bar"
+            labels={shown.map(r => r.tenant)}
+            datasets={barData}
+            chartOptions={barOptions}
+            height={horizHeight}
+          />
+        </div>
+      </div>
+
+      {/* Trend line for selected tenant */}
+      {selectedTenant && (
+        <div className="mt-5 pt-4 border-t border-gray-100 fade-in">
+          <p className="text-xs font-semibold text-gray-700 mb-3">
+            Daily trend — <span className="text-blue-600">{selectedTenant}</span>
+          </p>
+          <ChartCanvas
+            key={`trend-${selectedTenant}-${dates.join(',')}`}
+            type="line"
+            labels={dates}
+            datasets={trendDatasets}
+            chartOptions={{
+              responsive: true,
+              maintainAspectRatio: false,
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { grid: { color: '#f3f4f6' }, ticks: { font: { size: 11 } } },
+                y: { beginAtZero: true, ticks: { stepSize: 1 }, grid: { color: '#f3f4f6' } },
+              },
+            }}
+            height={200}
+          />
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── HeatmapGrid ────────────────────────────────────────────────────────────
@@ -503,10 +620,10 @@ function HeatmapGrid({ dates, tenants, byDateTenant }) {
   const shortDate = d => d.substring(5);
   return (
     <div className="overflow-x-auto">
-      <table className="text-xs border-collapse" style={{ minWidth: dates.length * 44 + 110 }}>
+      <table className="text-xs border-collapse" style={{ minWidth: dates.length * 44 + 180 }}>
         <thead>
           <tr>
-            <th className="text-gray-400 font-medium text-left pr-3 py-1" style={{ minWidth: 110 }}>Tenant</th>
+            <th className="text-gray-400 font-medium text-left pr-3 py-1" style={{ minWidth: 180 }}>Tenant / Facility</th>
             {dates.map(d => (
               <th key={d} className="text-gray-500 font-medium text-center px-1 py-1" style={{ minWidth: 40 }}>{shortDate(d)}</th>
             ))}
@@ -515,7 +632,7 @@ function HeatmapGrid({ dates, tenants, byDateTenant }) {
         <tbody>
           {tenants.map(tenant => (
             <tr key={tenant}>
-              <td className="text-gray-700 font-medium pr-3 py-0.5 truncate" style={{ maxWidth: 110 }}>{tenant}</td>
+              <td className="text-gray-700 font-medium pr-3 py-0.5 truncate" style={{ maxWidth: 180 }}>{tenant}</td>
               {dates.map(d => {
                 const count = byDateTenant[d]?.[tenant] || 0;
                 return (
@@ -540,36 +657,43 @@ function HeatmapGrid({ dates, tenants, byDateTenant }) {
 // ── ResolutionTable ────────────────────────────────────────────────────────
 
 function ResolutionTable({ events }) {
-  const [expandedTenant, setExpandedTenant] = useState(null);
-  const byTenant = {};
+  const [expandedKey, setExpandedKey] = useState(null);
+  const byKey = {};
   for (const e of events) {
-    if (!byTenant[e.tenantCode]) byTenant[e.tenantCode] = [];
-    byTenant[e.tenantCode].push(e);
+    const k = `${e.tenantCode}|||${e.facilityCode}`;
+    if (!byKey[k]) byKey[k] = [];
+    byKey[k].push(e);
   }
-  const tenants = Object.keys(byTenant).sort();
+  const keys = Object.keys(byKey).sort();
   return (
     <div className="space-y-2">
-      {tenants.map(tenant => {
-        const tevents = byTenant[tenant];
+      {keys.map(key => {
+        const [tenantCode, facilityCode] = key.split('|||');
+        const tevents = byKey[key];
         const resolved = tevents.filter(e => e.endTime);
         const ongoing = tevents.filter(e => !e.endTime);
         const avgMs = resolved.length > 0
           ? resolved.reduce((s, e) => s + (new Date(e.endTime) - new Date(e.startTime)), 0) / resolved.length
           : null;
-        const isOpen = expandedTenant === tenant;
+        const isOpen = expandedKey === key;
         return (
-          <div key={tenant} className="border border-gray-200 rounded-lg overflow-hidden">
+          <div key={key} className="border border-gray-200 rounded-lg overflow-hidden">
             <button
               className="w-full flex items-center gap-3 px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
-              onClick={() => setExpandedTenant(isOpen ? null : tenant)}
+              onClick={() => setExpandedKey(isOpen ? null : key)}
             >
-              <span className="font-semibold text-gray-800 flex-1 text-sm">{tenant}</span>
-              <span className="text-xs text-gray-500">{tevents.length} alert{tevents.length !== 1 ? 's' : ''}</span>
+              <div className="flex-1 min-w-0">
+                <span className="font-semibold text-gray-800 text-sm">{tenantCode}</span>
+                {facilityCode && facilityCode !== 'undefined' && (
+                  <span className="ml-2 text-xs text-gray-500 font-mono bg-gray-100 px-1.5 py-0.5 rounded">{facilityCode}</span>
+                )}
+              </div>
+              <span className="text-xs text-gray-500 shrink-0">{tevents.length} alert{tevents.length !== 1 ? 's' : ''}</span>
               {ongoing.length > 0 && (
-                <span className="text-xs font-medium px-2 py-0.5 rounded bg-red-100 text-red-700">{ongoing.length} ongoing</span>
+                <span className="text-xs font-medium px-2 py-0.5 rounded bg-red-100 text-red-700 shrink-0">{ongoing.length} ongoing</span>
               )}
               {avgMs !== null && (
-                <span className="text-xs text-gray-500">Avg resolve: <span className="font-semibold text-gray-700">{fmtDuration(avgMs)}</span></span>
+                <span className="text-xs text-gray-500 shrink-0">Avg resolve: <span className="font-semibold text-gray-700">{fmtDuration(avgMs)}</span></span>
               )}
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2"
                 style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
@@ -639,12 +763,14 @@ function AlertingSituationView({ alerts }) {
     return () => { cancelled = true; };
   }, [alerts]);
 
-  const tenants = [...new Set(allEvents.map(e => e.tenantCode))].sort();
+  const tenantFacilityKey = (e) => `${e.tenantCode} / ${e.facilityCode}`;
+  const tenants = [...new Set(allEvents.map(tenantFacilityKey))].sort();
   const byDateTenant = {};
   for (const e of allEvents) {
     const date = e.startTime ? e.startTime.substring(0, 10) : 'unknown';
+    const key = tenantFacilityKey(e);
     if (!byDateTenant[date]) byDateTenant[date] = {};
-    byDateTenant[date][e.tenantCode] = (byDateTenant[date][e.tenantCode] || 0) + 1;
+    byDateTenant[date][key] = (byDateTenant[date][key] || 0) + 1;
   }
   const dates = Object.keys(byDateTenant).sort();
 
@@ -666,15 +792,6 @@ function AlertingSituationView({ alerts }) {
     pointRadius: 4,
     pointBackgroundColor: '#3b82f6',
   }];
-
-  const chart1Labels = dates;
-  const chart1Datasets = tenants.map((t, i) => ({
-    label: t,
-    data: dates.map(d => byDateTenant[d]?.[t] || 0),
-    backgroundColor: PALETTE[i % PALETTE.length] + 'bb',
-    borderColor: PALETTE[i % PALETTE.length],
-    borderWidth: 1,
-  }));
 
   if (loading) return (
     <div className="py-12 text-center fade-in">
@@ -714,31 +831,25 @@ function AlertingSituationView({ alerts }) {
         <>
           {/* Chart: Aggregated time-wise */}
           <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Aggregated Alerts Over Time (All Tenants)</h4>
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Aggregated Alerts Over Time</h4>
             <ChartCanvas key={`agg-${chart3Labels.join(',')}`} type="line" labels={chart3Labels} datasets={chart3Datasets} />
           </div>
 
-          {/* Chart: Tenant-wise by date */}
+          {/* Chart: Tenant/Facility ranked + drill-down trend */}
           <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant-wise Alerts by Date</h4>
-            <ChartCanvas key={`tenant-${chart1Labels.join(',')}-${tenants.join(',')}`} type="bar" labels={chart1Labels} datasets={chart1Datasets}
-              chartOptions={{
-                responsive: true, maintainAspectRatio: false,
-                plugins: { legend: { position: 'top' } },
-                scales: { x: { stacked: false }, y: { beginAtZero: true, ticks: { stepSize: 1 } } },
-              }}
-            />
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant / Facility Alert Breakdown</h4>
+            <TenantAlertsBreakdown dates={dates} tenants={tenants} byDateTenant={byDateTenant} />
           </div>
 
           {/* Heatmap */}
           <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant × Date Heatmap</h4>
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant / Facility × Date Heatmap</h4>
             <HeatmapGrid dates={dates} tenants={tenants} byDateTenant={byDateTenant} />
           </div>
 
-          {/* Resolution times per tenant */}
+          {/* Resolution times per tenant/facility */}
           <div>
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Resolution Times by Tenant</h4>
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Resolution Times by Tenant / Facility</h4>
             <ResolutionTable events={allEvents} />
           </div>
         </>
@@ -756,15 +867,36 @@ function SignalDetailScreen({ signal, onBack }) {
   const [alertLoading, setAlertLoading] = useState(false);
   const [alertError, setAlertError] = useState(null);
   const [activeAlert, setActiveAlert] = useState(null);
-  const [showAlertSituation, setShowAlertSituation] = useState(false);
+
+  // Global situation toggle — covers ALL severities
+  const [showSituation, setShowSituation] = useState(false);
+  const [allAlerts, setAllAlerts] = useState(null); // null = not yet fetched
+  const [allAlertsLoading, setAllAlertsLoading] = useState(false);
+  const [allAlertsError, setAllAlertsError] = useState(null);
 
   const total = signal.severityCounts.CRITICAL + signal.severityCounts.WARNING + signal.severityCounts.LOW;
 
+  const toggleSituation = useCallback(async () => {
+    if (showSituation) { setShowSituation(false); return; }
+    setShowSituation(true);
+    if (allAlerts !== null) return; // already fetched
+    setAllAlertsLoading(true); setAllAlertsError(null);
+    try {
+      const results = await Promise.all(
+        ['CRITICAL', 'WARNING', 'LOW'].map(sev =>
+          apiFetch(`/api/alerts?${new URLSearchParams({ signalId: signal._id, severity: sev })}`)
+            .then(r => r.data || []).catch(() => [])
+        )
+      );
+      setAllAlerts(results.flat());
+    } catch (e) { setAllAlertsError(e.message); }
+    finally { setAllAlertsLoading(false); }
+  }, [showSituation, allAlerts, signal._id]);
+
   const selectSeverity = useCallback(async (sev) => {
-    if (sev === selectedSev) { setSelectedSev(null); setAlerts([]); setCritSummary(null); setActiveAlert(null); setShowAlertSituation(false); return; }
+    if (sev === selectedSev) { setSelectedSev(null); setAlerts([]); setCritSummary(null); setActiveAlert(null); return; }
     setSelectedSev(sev);
     setActiveAlert(null);
-    setShowAlertSituation(false);
     setAlertLoading(true); setAlertError(null);
     try {
       const params = new URLSearchParams({ signalId: signal._id, severity: sev });
@@ -781,107 +913,119 @@ function SignalDetailScreen({ signal, onBack }) {
 
   return (
     <div className="fade-in">
-      {/* breadcrumb */}
-      <div className="mb-6">
-        <BackButton onClick={onBack} label="All Signals" />
-        <h2 className="text-xl font-bold text-gray-900 mt-2">{signal.name}</h2>
-        {signal.description && <p className="text-sm text-gray-500 mt-1">{signal.description}</p>}
+      {/* breadcrumb + global toggle */}
+      <div className="mb-6 flex items-start gap-3">
+        <div className="flex-1">
+          <BackButton onClick={onBack} label="All Signals" />
+          <h2 className="text-xl font-bold text-gray-900 mt-2">{signal.name}</h2>
+          {signal.description && <p className="text-sm text-gray-500 mt-1">{signal.description}</p>}
+        </div>
+        <button
+          onClick={toggleSituation}
+          className={`mt-1 shrink-0 flex items-center gap-2 px-4 py-2 rounded-lg border font-semibold text-sm transition-all ${
+            showSituation
+              ? 'bg-blue-600 text-white border-blue-600 shadow'
+              : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50'
+          }`}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M18 20V10M12 20V4M6 20v-6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          Alert Situation
+          {showSituation && (
+            <span className="ml-1 text-xs font-normal opacity-80">· all severities</span>
+          )}
+        </button>
       </div>
 
-      {/* severity bars */}
-      <div className="grid grid-cols-3 gap-3 mb-6">
-        {['CRITICAL','WARNING','LOW'].map(sev => (
-          <SeverityBar
-            key={sev}
-            sev={sev}
-            count={signal.severityCounts[sev]}
-            total={total}
-            selected={selectedSev}
-            onClick={selectSeverity}
-          />
-        ))}
-      </div>
-
-      {/* alert list */}
-      {selectedSev && (
+      {/* Global situation view */}
+      {showSituation && (
         <div className="fade-in">
-          {/* CRITICAL summary banner */}
-          {selectedSev === 'CRITICAL' && critSummary && (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-5 py-3 mb-4 flex flex-wrap gap-6 fade-in">
-              <div>
-                <p className="text-xs text-red-400 uppercase tracking-wider font-medium">Affected Tenants</p>
-                <p className="text-2xl font-bold text-red-700">{critSummary.tenantCount}</p>
-              </div>
-              <div>
-                <p className="text-xs text-red-400 uppercase tracking-wider font-medium">Affected Facilities</p>
-                <p className="text-2xl font-bold text-red-700">{critSummary.facilityCount}</p>
-              </div>
-              <div className="ml-auto flex items-center">
-                <span className="text-sm text-red-600 font-semibold">{signal.severityCounts.CRITICAL} Critical Alerts</span>
-              </div>
+          {allAlertsLoading && (
+            <div className="py-8 text-center">
+              <Spinner />
+              <p className="text-sm text-gray-400 mt-2">Loading all alerts…</p>
             </div>
           )}
-
-          <div className="flex items-center mb-3">
-            <h3 className="text-sm font-semibold text-gray-700 flex-1">
-              {SEV_META[selectedSev].label} Alerts
-              <span className="text-gray-400 font-normal ml-2">· {signal.severityCounts[selectedSev]}</span>
-            </h3>
-            <button
-              onClick={() => { if (!alertLoading && alerts.length > 0) { setShowAlertSituation(v => !v); setActiveAlert(null); } }}
-              disabled={alertLoading || alerts.length === 0}
-              title={alertLoading ? 'Loading alerts…' : alerts.length === 0 ? 'No alerts to analyse' : 'Toggle alert situation view'}
-              className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full border transition-all ${
-                showAlertSituation
-                  ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
-                  : alertLoading || alerts.length === 0
-                    ? 'bg-gray-50 text-gray-300 border-gray-200 cursor-not-allowed'
-                    : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50'
-              }`}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M18 20V10M12 20V4M6 20v-6" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              Alert Situation
-            </button>
-          </div>
-
-          {alertLoading && <Spinner />}
-          {alertError && <ErrorBox msg={alertError} />}
-
-          {!alertLoading && !alertError && showAlertSituation ? (
-            <AlertingSituationView key={`${selectedSev}-situation`} alerts={alerts} />
-          ) : (
-            /* 2-col layout when history panel is open */
-            <div className={`${activeAlert ? 'grid gap-4' : ''}`} style={activeAlert ? { gridTemplateColumns: '1fr 420px' } : {}}>
-              <div className="grid grid-cols-1 gap-3 content-start">
-                {!alertLoading && alerts.map(alert => (
-                  <AlertTile
-                    key={alert._id}
-                    alert={alert}
-                    onClick={() => handleAlertClick(alert)}
-                    active={activeAlert?._id === alert._id}
-                  />
-                ))}
-                {!alertLoading && !alertError && alerts.length === 0 && (
-                  <p className="text-sm text-gray-400 py-6 text-center">No alerts found</p>
-                )}
-              </div>
-
-              {/* history panel */}
-              {activeAlert && (
-                <div className="self-start sticky top-4">
-                  <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Alert History</h3>
-                  <HistoryPanel alert={activeAlert} onClose={() => setActiveAlert(null)} />
-                </div>
-              )}
-            </div>
+          {allAlertsError && <ErrorBox msg={allAlertsError} />}
+          {!allAlertsLoading && !allAlertsError && allAlerts !== null && (
+            <AlertingSituationView key="global-situation" alerts={allAlerts} />
           )}
         </div>
       )}
 
-      {!selectedSev && (
-        <p className="text-sm text-gray-400 text-center py-8">Select a severity bar to see alerts</p>
+      {/* Normal severity view — hidden when situation is open */}
+      {!showSituation && (
+        <>
+          {/* severity bars */}
+          <div className="grid grid-cols-3 gap-3 mb-6">
+            {['CRITICAL','WARNING','LOW'].map(sev => (
+              <SeverityBar
+                key={sev}
+                sev={sev}
+                count={signal.severityCounts[sev]}
+                total={total}
+                selected={selectedSev}
+                onClick={selectSeverity}
+              />
+            ))}
+          </div>
+
+          {/* alert list */}
+          {selectedSev && (
+            <div className="fade-in">
+              {selectedSev === 'CRITICAL' && critSummary && (
+                <div className="rounded-lg border border-red-200 bg-red-50 px-5 py-3 mb-4 flex flex-wrap gap-6 fade-in">
+                  <div>
+                    <p className="text-xs text-red-400 uppercase tracking-wider font-medium">Affected Tenants</p>
+                    <p className="text-2xl font-bold text-red-700">{critSummary.tenantCount}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-red-400 uppercase tracking-wider font-medium">Affected Facilities</p>
+                    <p className="text-2xl font-bold text-red-700">{critSummary.facilityCount}</p>
+                  </div>
+                  <div className="ml-auto flex items-center">
+                    <span className="text-sm text-red-600 font-semibold">{signal.severityCounts.CRITICAL} Critical Alerts</span>
+                  </div>
+                </div>
+              )}
+
+              <h3 className="text-sm font-semibold text-gray-700 mb-3">
+                {SEV_META[selectedSev].label} Alerts
+                <span className="text-gray-400 font-normal ml-2">· {signal.severityCounts[selectedSev]}</span>
+              </h3>
+
+              {alertLoading && <Spinner />}
+              {alertError && <ErrorBox msg={alertError} />}
+
+              <div className={`${activeAlert ? 'grid gap-4' : ''}`} style={activeAlert ? { gridTemplateColumns: '1fr 420px' } : {}}>
+                <div className="grid grid-cols-1 gap-3 content-start">
+                  {!alertLoading && alerts.map(alert => (
+                    <AlertTile
+                      key={alert._id}
+                      alert={alert}
+                      onClick={() => handleAlertClick(alert)}
+                      active={activeAlert?._id === alert._id}
+                    />
+                  ))}
+                  {!alertLoading && !alertError && alerts.length === 0 && (
+                    <p className="text-sm text-gray-400 py-6 text-center">No alerts found</p>
+                  )}
+                </div>
+                {activeAlert && (
+                  <div className="self-start sticky top-4">
+                    <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Alert History</h3>
+                    <HistoryPanel alert={activeAlert} onClose={() => setActiveAlert(null)} />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!selectedSev && (
+            <p className="text-sm text-gray-400 text-center py-8">Select a severity bar to see alerts</p>
+          )}
+        </>
       )}
     </div>
   );
