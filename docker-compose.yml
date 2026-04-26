@@ -1,0 +1,11 @@
+services:
+  alert-dashboard:
+    build: .
+    container_name: alert-dashboard
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3002}:${PORT:-3002}"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Alert Dashboard</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            critical: { DEFAULT: '#dc2626', light: '#fef2f2', border: '#fecaca' },
+            warning:  { DEFAULT: '#d97706', light: '#fffbeb', border: '#fde68a' },
+            low:      { DEFAULT: '#2563eb', light: '#eff6ff', border: '#bfdbfe' },
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8f9fa; color: #111; }
+    .fade-in { animation: fadeIn 0.15s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    .history-slide { animation: slideIn 0.2s ease; }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+const SEV_META = {
+  CRITICAL: { label: 'Critical', color: '#dc2626', bg: '#fef2f2', border: '#fecaca', tone: 'text-red-600' },
+  WARNING:  { label: 'Warning',  color: '#d97706', bg: '#fffbeb', border: '#fde68a', tone: 'text-amber-600' },
+  LOW:      { label: 'Low',      color: '#2563eb', bg: '#eff6ff', border: '#bfdbfe', tone: 'text-blue-600' },
+};
+
+const STATUS_COLORS = {
+  FIRING:   'bg-red-100 text-red-700',
+  RESOLVED: 'bg-green-100 text-green-700',
+  MUTED:    'bg-gray-100 text-gray-600',
+};
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString('en-IN', { dateStyle: 'short', timeStyle: 'short' });
+}
+
+async function apiFetch(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+// ── tiny components ────────────────────────────────────────────────────────
+
+function Spinner() {
+  return (
+    <div className="flex items-center justify-center py-16">
+      <div className="w-8 h-8 border-2 border-gray-200 border-t-gray-500 rounded-full animate-spin" />
+    </div>
+  );
+}
+
+function ErrorBox({ msg, onRetry }) {
+  return (
+    <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex items-center gap-3">
+      <span className="flex-1">{msg}</span>
+      {onRetry && <button onClick={onRetry} className="underline text-red-800 font-medium">Retry</button>}
+    </div>
+  );
+}
+
+function SeverityPill({ sev, size = 'sm' }) {
+  const m = SEV_META[sev] || SEV_META.LOW;
+  const pad = size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-3 py-1 text-sm';
+  return (
+    <span
+      className={`inline-block rounded font-medium ${pad}`}
+      style={{ background: m.bg, color: m.color, border: `1px solid ${m.border}` }}
+    >
+      {m.label}
+    </span>
+  );
+}
+
+function StatusPill({ status }) {
+  const cls = STATUS_COLORS[status] || 'bg-gray-100 text-gray-600';
+  return <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${cls}`}>{status}</span>;
+}
+
+function BackButton({ onClick, label }) {
+  return (
+    <button onClick={onClick} className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-800 transition-colors">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2">
+        <path d="M9 2L4 7l5 5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      {label}
+    </button>
+  );
+}
+
+// ── SignalList screen ──────────────────────────────────────────────────────
+
+function SignalCard({ signal, onClick }) {
+  const { severityCounts, total } = signal;
+  return (
+    <button
+      onClick={onClick}
+      className="w-full text-left rounded-lg border border-gray-200 bg-white px-5 py-4 hover:border-gray-400 hover:bg-gray-50 transition-all fade-in"
+    >
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div>
+          <p className="font-semibold text-gray-900 leading-tight">{signal.name}</p>
+          <p className="text-xs text-gray-400 mt-0.5 font-mono">{signal.signalCode}</p>
+        </div>
+        <span className="shrink-0 text-xs rounded bg-gray-100 text-gray-600 px-2 py-0.5 font-medium uppercase tracking-wide">
+          {signal.module}
+        </span>
+      </div>
+      <p className="text-sm text-gray-500 line-clamp-2 mb-3">{signal.description}</p>
+      <div className="flex items-center gap-2">
+        {['CRITICAL','WARNING','LOW'].map(s => {
+          const m = SEV_META[s];
+          const count = severityCounts[s];
+          if (count === 0) return null;
+          return (
+            <span
+              key={s}
+              className="text-xs font-semibold px-2 py-0.5 rounded"
+              style={{ background: m.bg, color: m.color, border: `1px solid ${m.border}` }}
+            >
+              {count} {m.label}
+            </span>
+          );
+        })}
+        {total === 0 && <span className="text-xs text-gray-400">No active alerts</span>}
+      </div>
+    </button>
+  );
+}
+
+function SignalListScreen({ onSelectSignal }) {
+  const [signals, setSignals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const { data } = await apiFetch('/api/signals');
+      setSignals(data);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const totals = signals.reduce((acc, s) => {
+    acc.CRITICAL += s.severityCounts.CRITICAL;
+    acc.WARNING  += s.severityCounts.WARNING;
+    acc.LOW      += s.severityCounts.LOW;
+    return acc;
+  }, { CRITICAL: 0, WARNING: 0, LOW: 0 });
+
+  return (
+    <div>
+      {/* Summary strip */}
+      {signals.length > 0 && (
+        <div className="flex items-center gap-4 mb-6">
+          {['CRITICAL','WARNING','LOW'].map(s => {
+            const m = SEV_META[s];
+            return (
+              <div key={s} className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full" style={{ background: m.color }} />
+                <span className="text-sm font-semibold" style={{ color: m.color }}>{totals[s]}</span>
+                <span className="text-sm text-gray-500">{m.label}</span>
+              </div>
+            );
+          })}
+          <span className="ml-auto text-xs text-gray-400">{signals.length} signals</span>
+        </div>
+      )}
+
+      {loading && <Spinner />}
+      {error && <ErrorBox msg={error} onRetry={load} />}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {signals.map(sig => (
+          <SignalCard key={sig._id} signal={sig} onClick={() => onSelectSignal(sig)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── SeverityBar ────────────────────────────────────────────────────────────
+
+function SeverityBar({ sev, count, total, selected, onClick }) {
+  const m = SEV_META[sev];
+  const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+  const isActive = selected === sev;
+  return (
+    <button
+      onClick={() => count > 0 && onClick(sev)}
+      disabled={count === 0}
+      className={`w-full rounded-lg border px-5 py-4 text-left transition-all ${
+        count === 0 ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer hover:opacity-90'
+      } ${isActive ? 'ring-2 ring-offset-1' : ''}`}
+      style={{
+        background: isActive ? m.bg : '#fff',
+        borderColor: isActive ? m.color : '#e5e7eb',
+        ['--tw-ring-color']: m.color,
+      }}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <span className="font-semibold text-base" style={{ color: m.color }}>{m.label}</span>
+        <span className="text-2xl font-bold" style={{ color: m.color }}>{count}</span>
+      </div>
+      {/* progress bar */}
+      <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-300"
+          style={{ width: `${pct}%`, background: m.color }}
+        />
+      </div>
+      <p className="text-xs text-gray-400 mt-1.5">{pct}% of total</p>
+    </button>
+  );
+}
+
+// ── AlertTile ──────────────────────────────────────────────────────────────
+
+function MetricChip({ heading, count, subheading }) {
+  return (
+    <div className="rounded bg-gray-50 border border-gray-100 px-3 py-2 text-center">
+      <p className="text-xs text-gray-500">{heading}</p>
+      <p className="text-lg font-bold text-gray-800">{count}</p>
+      <p className="text-xs text-gray-400 leading-tight">{subheading}</p>
+    </div>
+  );
+}
+
+function AlertTile({ alert, onClick, active }) {
+  const tpl = alert.template || {};
+  const metrics = tpl.metric || [];
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left rounded-lg border px-4 py-4 transition-all fade-in ${
+        active
+          ? 'border-gray-700 bg-gray-50 ring-1 ring-gray-700'
+          : 'border-gray-200 bg-white hover:border-gray-400'
+      }`}
+    >
+      {/* heading row */}
+      <div className="flex items-start gap-2 mb-2">
+        <div className="flex-1 min-w-0">
+          <p className="font-semibold text-gray-900 text-sm leading-tight truncate">
+            {tpl.heading || alert.fingerprint}
+          </p>
+        </div>
+        <StatusPill status={alert.status} />
+      </div>
+
+      {/* tenant / facility */}
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
+        <span><span className="text-gray-400">Tenant</span> <span className="font-medium text-gray-700">{alert.tenantCode}</span></span>
+        <span><span className="text-gray-400">Facility</span> <span className="font-medium text-gray-700">{alert.facilityCode}</span></span>
+      </div>
+
+      {/* metrics */}
+      {metrics.length > 0 && (
+        <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.min(metrics.length, 3)}, 1fr)` }}>
+          {metrics.map((m, i) => (
+            <MetricChip key={i} heading={m.heading} count={m.count} subheading={m.subheading} />
+          ))}
+        </div>
+      )}
+
+      {/* timestamp */}
+      <p className="text-xs text-gray-400 mt-2.5">Updated {fmtTime(alert.updatedAt)}</p>
+    </button>
+  );
+}
+
+// ── HistoryPanel ───────────────────────────────────────────────────────────
+
+function HistoryEntry({ entry }) {
+  const sev = (entry.severity || '').toUpperCase();
+  const m = SEV_META[sev] || SEV_META.LOW;
+  const tpl = entry.template || {};
+  const metrics = tpl.metric || [];
+  return (
+    <div
+      className="border-b border-gray-100 last:border-0 py-4 history-slide"
+      style={{ borderLeft: `3px solid ${m.color}`, paddingLeft: '12px', marginLeft: '-1px' }}
+    >
+      {/* heading row */}
+      <div className="flex items-start gap-2 mb-1">
+        <p className="flex-1 text-sm font-semibold text-gray-900 leading-tight">
+          {tpl.heading || '—'}
+        </p>
+        <span
+          className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded"
+          style={{ background: m.bg, color: m.color, border: `1px solid ${m.border}` }}
+        >
+          {m.label}
+        </span>
+      </div>
+
+      {/* description */}
+      {tpl.description && (
+        <p className="text-xs text-gray-500 mb-2 leading-relaxed">{tpl.description}</p>
+      )}
+
+      {/* metrics */}
+      {metrics.length > 0 && (
+        <div className="flex flex-wrap gap-2 mb-2.5">
+          {metrics.map((metric, i) => (
+            <div
+              key={i}
+              className="rounded border px-2.5 py-1.5 text-xs flex flex-col items-center min-w-[72px]"
+              style={{ background: m.bg, borderColor: m.border }}
+            >
+              <span className="text-gray-500 font-medium">{metric.heading}</span>
+              <span className="text-xl font-bold leading-tight" style={{ color: m.color }}>{metric.count}</span>
+              <span className="text-gray-500">{metric.subheading}</span>
+              {metric.timestamp && (
+                <span className="text-gray-400 mt-0.5 text-center leading-tight">{metric.timestamp}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* timestamps */}
+      <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-gray-400 mt-1">
+        {entry.lastReceived && (
+          <span>Last received <span className="text-gray-600 font-medium">{fmtTime(entry.lastReceived)}</span></span>
+        )}
+        {entry.lastRefreshTime && (
+          <span>Data refresh <span className="text-gray-600 font-medium">{fmtTime(entry.lastRefreshTime)}</span></span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HistoryPanel({ alert, onClose }) {
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setError(null);
+      try {
+        const data = await apiFetch(`/api/alerts/${alert.fingerprint}/history`);
+        if (!cancelled) setHistory(data.data || data || []);
+      } catch (e) {
+        if (!cancelled) setError(e.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [alert.fingerprint]);
+
+  const alertSev = (alert.severity || '').toUpperCase();
+  const alertMeta = SEV_META[alertSev] || SEV_META.LOW;
+
+  return (
+    <div className="rounded-lg border bg-white overflow-hidden history-slide" style={{ borderColor: alertMeta.border }}>
+      <div className="flex items-start gap-3 px-4 py-3 border-b" style={{ background: alertMeta.bg, borderColor: alertMeta.border }}>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="text-xs font-semibold" style={{ color: alertMeta.color }}>{alertMeta.label}</span>
+            <StatusPill status={alert.status} />
+          </div>
+          <p className="text-sm font-semibold text-gray-900 truncate">{alert.template?.heading || 'Alert History'}</p>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1 text-xs text-gray-500">
+            {alert.lastReceived && (
+              <span>Last received <span className="font-medium text-gray-700">{fmtTime(alert.lastReceived)}</span></span>
+            )}
+            {alert.lastRefreshTime && (
+              <span>Data refresh <span className="font-medium text-gray-700">{fmtTime(alert.lastRefreshTime)}</span></span>
+            )}
+          </div>
+        </div>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-700 transition-colors p-1 mt-0.5 shrink-0" title="Close">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M2 2l10 10M12 2L2 12" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+      <div className="px-4 max-h-96 overflow-y-auto">
+        {loading && <Spinner />}
+        {error && <div className="py-4"><ErrorBox msg={error} /></div>}
+        {!loading && !error && history.length === 0 && (
+          <p className="text-sm text-gray-400 py-4 text-center">No history found</p>
+        )}
+        {history.map((entry, i) => <HistoryEntry key={i} entry={entry} />)}
+      </div>
+    </div>
+  );
+}
+
+// ── SignalDetail screen ────────────────────────────────────────────────────
+
+function SignalDetailScreen({ signal, onBack }) {
+  const [selectedSev, setSelectedSev] = useState(null);
+  const [alerts, setAlerts] = useState([]);
+  const [critSummary, setCritSummary] = useState(null);
+  const [alertLoading, setAlertLoading] = useState(false);
+  const [alertError, setAlertError] = useState(null);
+  const [activeAlert, setActiveAlert] = useState(null);
+
+  const total = signal.severityCounts.CRITICAL + signal.severityCounts.WARNING + signal.severityCounts.LOW;
+
+  const selectSeverity = useCallback(async (sev) => {
+    if (sev === selectedSev) { setSelectedSev(null); setAlerts([]); setCritSummary(null); setActiveAlert(null); return; }
+    setSelectedSev(sev);
+    setActiveAlert(null);
+    setAlertLoading(true); setAlertError(null);
+    try {
+      const params = new URLSearchParams({ signalId: signal._id, severity: sev });
+      const { data, summary } = await apiFetch(`/api/alerts?${params}`);
+      setAlerts(data);
+      setCritSummary(summary);
+    } catch (e) { setAlertError(e.message); }
+    finally { setAlertLoading(false); }
+  }, [selectedSev, signal._id]);
+
+  const handleAlertClick = useCallback((alert) => {
+    setActiveAlert(prev => prev?._id === alert._id ? null : alert);
+  }, []);
+
+  return (
+    <div className="fade-in">
+      {/* breadcrumb */}
+      <div className="mb-6">
+        <BackButton onClick={onBack} label="All Signals" />
+        <h2 className="text-xl font-bold text-gray-900 mt-2">{signal.name}</h2>
+        {signal.description && <p className="text-sm text-gray-500 mt-1">{signal.description}</p>}
+      </div>
+
+      {/* severity bars */}
+      <div className="grid grid-cols-3 gap-3 mb-6">
+        {['CRITICAL','WARNING','LOW'].map(sev => (
+          <SeverityBar
+            key={sev}
+            sev={sev}
+            count={signal.severityCounts[sev]}
+            total={total}
+            selected={selectedSev}
+            onClick={selectSeverity}
+          />
+        ))}
+      </div>
+
+      {/* alert list */}
+      {selectedSev && (
+        <div className="fade-in">
+          {/* CRITICAL summary banner */}
+          {selectedSev === 'CRITICAL' && critSummary && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-5 py-3 mb-4 flex flex-wrap gap-6 fade-in">
+              <div>
+                <p className="text-xs text-red-400 uppercase tracking-wider font-medium">Affected Tenants</p>
+                <p className="text-2xl font-bold text-red-700">{critSummary.tenantCount}</p>
+              </div>
+              <div>
+                <p className="text-xs text-red-400 uppercase tracking-wider font-medium">Affected Facilities</p>
+                <p className="text-2xl font-bold text-red-700">{critSummary.facilityCount}</p>
+              </div>
+              <div className="ml-auto flex items-center">
+                <span className="text-sm text-red-600 font-semibold">{signal.severityCounts.CRITICAL} Critical Alerts</span>
+              </div>
+            </div>
+          )}
+
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">
+            {SEV_META[selectedSev].label} Alerts
+            <span className="text-gray-400 font-normal ml-2">· {signal.severityCounts[selectedSev]}</span>
+          </h3>
+
+          {alertLoading && <Spinner />}
+          {alertError && <ErrorBox msg={alertError} />}
+
+          {/* 2-col layout when history panel is open */}
+          <div className={`${activeAlert ? 'grid gap-4' : ''}`} style={activeAlert ? { gridTemplateColumns: '1fr 420px' } : {}}>
+            <div className="grid grid-cols-1 gap-3 content-start">
+              {!alertLoading && alerts.map(alert => (
+                <AlertTile
+                  key={alert._id}
+                  alert={alert}
+                  onClick={() => handleAlertClick(alert)}
+                  active={activeAlert?._id === alert._id}
+                />
+              ))}
+              {!alertLoading && !alertError && alerts.length === 0 && (
+                <p className="text-sm text-gray-400 py-6 text-center">No alerts found</p>
+              )}
+            </div>
+
+            {/* history panel */}
+            {activeAlert && (
+              <div className="self-start sticky top-4">
+                <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Alert History</h3>
+                <HistoryPanel alert={activeAlert} onClose={() => setActiveAlert(null)} />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!selectedSev && (
+        <p className="text-sm text-gray-400 text-center py-8">Select a severity bar to see alerts</p>
+      )}
+    </div>
+  );
+}
+
+// ── App root ───────────────────────────────────────────────────────────────
+
+function App() {
+  const [selectedSignal, setSelectedSignal] = useState(null);
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* top bar */}
+      <header className="border-b border-gray-200 bg-white">
+        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center gap-4">
+          <button
+            onClick={() => setSelectedSignal(null)}
+            className="font-bold text-lg text-gray-900 hover:text-gray-600 transition-colors"
+          >
+            Alert Dashboard
+          </button>
+          {selectedSignal && (
+            <>
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#9ca3af" strokeWidth="2">
+                <path d="M4 2l5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span className="text-base text-gray-500 truncate max-w-xs">{selectedSignal.name}</span>
+            </>
+          )}
+        </div>
+      </header>
+
+      {/* content */}
+      <main className="max-w-6xl mx-auto px-6 py-8">
+        {!selectedSignal ? (
+          <>
+            <div className="mb-6">
+              <h1 className="text-2xl font-bold text-gray-900">Signals</h1>
+              <p className="text-sm text-gray-500 mt-1">Click a signal to explore severity breakdown and alerts</p>
+            </div>
+            <SignalListScreen onSelectSignal={setSelectedSignal} />
+          </>
+        ) : (
+          <SignalDetailScreen signal={selectedSignal} onBack={() => setSelectedSignal(null)} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
