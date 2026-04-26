@@ -8,6 +8,7 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script>
     tailwind.config = {
       theme: {
@@ -61,6 +62,54 @@ async function apiFetch(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
+}
+
+// ── Alert-situation helpers ────────────────────────────────────────────────
+
+const PALETTE = [
+  '#3b82f6','#ef4444','#10b981','#f59e0b','#8b5cf6',
+  '#ec4899','#06b6d4','#84cc16','#f97316','#6366f1',
+  '#14b8a6','#f43f5e','#a855f7','#0ea5e9','#22c55e',
+];
+
+function fmtDuration(ms) {
+  if (ms == null || ms < 0) return '—';
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function deriveAlertEvents(fingerprint, tenantCode, facilityCode, history) {
+  if (!history || history.length === 0) return [];
+  const sorted = [...history].sort((a, b) =>
+    new Date(a.lastReceived || 0) - new Date(b.lastReceived || 0)
+  );
+  const events = [];
+  let prevSev = null;
+  let currentEvent = null;
+  for (const entry of sorted) {
+    const sev = (entry.severity || '').toUpperCase();
+    const time = entry.lastReceived;
+    if (prevSev === null) {
+      // First entry — if non-LOW treat as alert start
+      if (sev === 'CRITICAL' || sev === 'WARNING') {
+        currentEvent = { fingerprint, tenantCode, facilityCode, severity: sev, startTime: time, endTime: null };
+      }
+    } else if (prevSev === 'LOW' && (sev === 'CRITICAL' || sev === 'WARNING')) {
+      currentEvent = { fingerprint, tenantCode, facilityCode, severity: sev, startTime: time, endTime: null };
+    } else if ((prevSev === 'CRITICAL' || prevSev === 'WARNING') && sev === 'LOW') {
+      if (currentEvent) {
+        currentEvent.endTime = time;
+        events.push({ ...currentEvent });
+        currentEvent = null;
+      }
+    }
+    // CRITICAL→CRITICAL, CRITICAL→WARNING, WARNING→CRITICAL, LOW→LOW = no new event
+    prevSev = sev;
+  }
+  if (currentEvent) events.push({ ...currentEvent, ongoing: true });
+  return events;
 }
 
 // ── tiny components ────────────────────────────────────────────────────────
@@ -274,10 +323,16 @@ function AlertTile({ alert, onClick, active }) {
         <StatusPill status={alert.status} />
       </div>
 
-      {/* tenant / facility */}
+      {/* tenant / facility / fingerprint */}
       <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
         <span><span className="text-gray-400">Tenant</span> <span className="font-medium text-gray-700">{alert.tenantCode}</span></span>
         <span><span className="text-gray-400">Facility</span> <span className="font-medium text-gray-700">{alert.facilityCode}</span></span>
+        {alert.fingerprint && (
+          <span className="w-full mt-0.5">
+            <span className="text-gray-400">Fingerprint</span>{' '}
+            <span className="font-mono text-gray-600 text-xs">{alert.fingerprint}</span>
+          </span>
+        )}
       </div>
 
       {/* metrics */}
@@ -418,6 +473,280 @@ function HistoryPanel({ alert, onClose }) {
   );
 }
 
+// ── ChartCanvas ────────────────────────────────────────────────────────────
+
+function ChartCanvas({ type, labels, datasets, chartOptions }) {
+  const canvasRef = React.useRef(null);
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    const chart = new Chart(canvasRef.current, {
+      type,
+      data: { labels, datasets },
+      options: chartOptions || {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'top' } },
+        scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } },
+      },
+    });
+    return () => chart.destroy();
+  }, []);
+  return <div style={{ height: 260 }}><canvas ref={canvasRef} /></div>;
+}
+
+// ── HeatmapGrid ────────────────────────────────────────────────────────────
+
+function HeatmapGrid({ dates, tenants, byDateTenant }) {
+  if (!dates.length || !tenants.length) return null;
+  const max = Math.max(1, ...dates.flatMap(d => tenants.map(t => byDateTenant[d]?.[t] || 0)));
+  const cellColor = (count) => count === 0 ? '#f3f4f6' : `rgba(220,38,38,${0.15 + (count / max) * 0.75})`;
+  const shortDate = d => d.substring(5);
+  return (
+    <div className="overflow-x-auto">
+      <table className="text-xs border-collapse" style={{ minWidth: dates.length * 44 + 110 }}>
+        <thead>
+          <tr>
+            <th className="text-gray-400 font-medium text-left pr-3 py-1" style={{ minWidth: 110 }}>Tenant</th>
+            {dates.map(d => (
+              <th key={d} className="text-gray-500 font-medium text-center px-1 py-1" style={{ minWidth: 40 }}>{shortDate(d)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {tenants.map(tenant => (
+            <tr key={tenant}>
+              <td className="text-gray-700 font-medium pr-3 py-0.5 truncate" style={{ maxWidth: 110 }}>{tenant}</td>
+              {dates.map(d => {
+                const count = byDateTenant[d]?.[tenant] || 0;
+                return (
+                  <td key={d} title={`${tenant} / ${d}: ${count} alert(s)`} className="text-center py-0.5 px-0.5">
+                    <div
+                      className="rounded mx-auto flex items-center justify-center font-semibold"
+                      style={{ width: 32, height: 24, background: cellColor(count), color: count > 0 ? '#7f1d1d' : '#9ca3af', fontSize: 10 }}
+                    >
+                      {count || ''}
+                    </div>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── ResolutionTable ────────────────────────────────────────────────────────
+
+function ResolutionTable({ events }) {
+  const [expandedTenant, setExpandedTenant] = useState(null);
+  const byTenant = {};
+  for (const e of events) {
+    if (!byTenant[e.tenantCode]) byTenant[e.tenantCode] = [];
+    byTenant[e.tenantCode].push(e);
+  }
+  const tenants = Object.keys(byTenant).sort();
+  return (
+    <div className="space-y-2">
+      {tenants.map(tenant => {
+        const tevents = byTenant[tenant];
+        const resolved = tevents.filter(e => e.endTime);
+        const ongoing = tevents.filter(e => !e.endTime);
+        const avgMs = resolved.length > 0
+          ? resolved.reduce((s, e) => s + (new Date(e.endTime) - new Date(e.startTime)), 0) / resolved.length
+          : null;
+        const isOpen = expandedTenant === tenant;
+        return (
+          <div key={tenant} className="border border-gray-200 rounded-lg overflow-hidden">
+            <button
+              className="w-full flex items-center gap-3 px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
+              onClick={() => setExpandedTenant(isOpen ? null : tenant)}
+            >
+              <span className="font-semibold text-gray-800 flex-1 text-sm">{tenant}</span>
+              <span className="text-xs text-gray-500">{tevents.length} alert{tevents.length !== 1 ? 's' : ''}</span>
+              {ongoing.length > 0 && (
+                <span className="text-xs font-medium px-2 py-0.5 rounded bg-red-100 text-red-700">{ongoing.length} ongoing</span>
+              )}
+              {avgMs !== null && (
+                <span className="text-xs text-gray-500">Avg resolve: <span className="font-semibold text-gray-700">{fmtDuration(avgMs)}</span></span>
+              )}
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2"
+                style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
+                <path d="M2 4l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {isOpen && (
+              <div className="divide-y divide-gray-100">
+                {tevents.map((e, i) => {
+                  const duration = e.endTime ? new Date(e.endTime) - new Date(e.startTime) : null;
+                  const m = SEV_META[e.severity] || SEV_META.LOW;
+                  return (
+                    <div key={i} className="px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
+                      <span className="rounded px-1.5 py-0.5 font-semibold shrink-0"
+                        style={{ background: m.bg, color: m.color, border: `1px solid ${m.border}` }}>
+                        {m.label}
+                      </span>
+                      <span className="text-gray-500">Started <span className="text-gray-700 font-medium">{fmtTime(e.startTime)}</span></span>
+                      {e.endTime
+                        ? <span className="text-gray-500">Resolved <span className="text-gray-700 font-medium">{fmtTime(e.endTime)}</span></span>
+                        : <span className="text-red-600 font-semibold">Ongoing</span>
+                      }
+                      <span className="ml-auto text-gray-500 shrink-0">
+                        Resolution time: <span className="font-semibold text-gray-700">{fmtDuration(duration)}</span>
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── AlertingSituationView ──────────────────────────────────────────────────
+
+function AlertingSituationView({ alerts }) {
+  const [allEvents, setAllEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let done = 0;
+    const total = alerts.length;
+    setLoading(true); setError(null); setAllEvents([]); setProgress(0);
+    Promise.all(
+      alerts.map(async (alert) => {
+        try {
+          const data = await apiFetch(`/api/alerts/${alert.fingerprint}/history`);
+          const history = data.data || data || [];
+          const events = deriveAlertEvents(alert.fingerprint, alert.tenantCode, alert.facilityCode, history);
+          done++;
+          if (!cancelled) setProgress(Math.round((done / total) * 100));
+          return events;
+        } catch { done++; return []; }
+      })
+    ).then(results => {
+      if (!cancelled) { setAllEvents(results.flat()); setLoading(false); }
+    }).catch(e => {
+      if (!cancelled) { setError(e.message); setLoading(false); }
+    });
+    return () => { cancelled = true; };
+  }, [alerts]);
+
+  const tenants = [...new Set(allEvents.map(e => e.tenantCode))].sort();
+  const byDateTenant = {};
+  for (const e of allEvents) {
+    const date = e.startTime ? e.startTime.substring(0, 10) : 'unknown';
+    if (!byDateTenant[date]) byDateTenant[date] = {};
+    byDateTenant[date][e.tenantCode] = (byDateTenant[date][e.tenantCode] || 0) + 1;
+  }
+  const dates = Object.keys(byDateTenant).sort();
+
+  const resolved = allEvents.filter(e => e.endTime);
+  const ongoing = allEvents.filter(e => !e.endTime);
+  const avgResolutionMs = resolved.length > 0
+    ? resolved.reduce((s, e) => s + (new Date(e.endTime) - new Date(e.startTime)), 0) / resolved.length
+    : null;
+
+  const chart3Labels = dates;
+  const chart3Datasets = [{
+    label: 'Total Alerts',
+    data: dates.map(d => Object.values(byDateTenant[d]).reduce((s, v) => s + v, 0)),
+    fill: true,
+    backgroundColor: 'rgba(59,130,246,0.12)',
+    borderColor: '#3b82f6',
+    borderWidth: 2,
+    tension: 0.35,
+    pointRadius: 4,
+    pointBackgroundColor: '#3b82f6',
+  }];
+
+  const chart1Labels = dates;
+  const chart1Datasets = tenants.map((t, i) => ({
+    label: t,
+    data: dates.map(d => byDateTenant[d]?.[t] || 0),
+    backgroundColor: PALETTE[i % PALETTE.length] + 'bb',
+    borderColor: PALETTE[i % PALETTE.length],
+    borderWidth: 1,
+  }));
+
+  if (loading) return (
+    <div className="py-12 text-center fade-in">
+      <Spinner />
+      <p className="text-sm text-gray-400 mt-3">Fetching alert histories… {progress}%</p>
+      <div className="w-48 h-1.5 bg-gray-200 rounded-full mx-auto mt-2">
+        <div className="h-full bg-blue-500 rounded-full transition-all duration-300" style={{ width: `${progress}%` }} />
+      </div>
+    </div>
+  );
+
+  if (error) return <ErrorBox msg={error} />;
+
+  return (
+    <div className="space-y-5 fade-in">
+      {/* Summary */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { label: 'Total Alert Events', value: allEvents.length, color: '#111827' },
+          { label: 'Ongoing', value: ongoing.length, color: '#dc2626' },
+          { label: 'Resolved', value: resolved.length, color: '#059669' },
+          { label: 'Avg Resolution', value: avgResolutionMs != null ? fmtDuration(avgResolutionMs) : '—', color: '#6b7280' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="rounded-lg border border-gray-200 bg-white px-4 py-3 text-center">
+            <p className="text-xs text-gray-400 mb-1">{label}</p>
+            <p className="text-2xl font-bold" style={{ color }}>{value}</p>
+          </div>
+        ))}
+      </div>
+
+      {allEvents.length === 0 ? (
+        <div className="text-center py-10 text-sm text-gray-400 bg-white rounded-lg border border-gray-200">
+          No alert events detected.<br />
+          <span className="text-xs">Alert events are state transitions: LOW → CRITICAL or LOW → WARNING.</span>
+        </div>
+      ) : (
+        <>
+          {/* Chart: Aggregated time-wise */}
+          <div className="rounded-lg border border-gray-200 bg-white p-4">
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Aggregated Alerts Over Time (All Tenants)</h4>
+            <ChartCanvas key={`agg-${chart3Labels.join(',')}`} type="line" labels={chart3Labels} datasets={chart3Datasets} />
+          </div>
+
+          {/* Chart: Tenant-wise by date */}
+          <div className="rounded-lg border border-gray-200 bg-white p-4">
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant-wise Alerts by Date</h4>
+            <ChartCanvas key={`tenant-${chart1Labels.join(',')}-${tenants.join(',')}`} type="bar" labels={chart1Labels} datasets={chart1Datasets}
+              chartOptions={{
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { position: 'top' } },
+                scales: { x: { stacked: false }, y: { beginAtZero: true, ticks: { stepSize: 1 } } },
+              }}
+            />
+          </div>
+
+          {/* Heatmap */}
+          <div className="rounded-lg border border-gray-200 bg-white p-4">
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant × Date Heatmap</h4>
+            <HeatmapGrid dates={dates} tenants={tenants} byDateTenant={byDateTenant} />
+          </div>
+
+          {/* Resolution times per tenant */}
+          <div>
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">Resolution Times by Tenant</h4>
+            <ResolutionTable events={allEvents} />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── SignalDetail screen ────────────────────────────────────────────────────
 
 function SignalDetailScreen({ signal, onBack }) {
@@ -427,13 +756,15 @@ function SignalDetailScreen({ signal, onBack }) {
   const [alertLoading, setAlertLoading] = useState(false);
   const [alertError, setAlertError] = useState(null);
   const [activeAlert, setActiveAlert] = useState(null);
+  const [showAlertSituation, setShowAlertSituation] = useState(false);
 
   const total = signal.severityCounts.CRITICAL + signal.severityCounts.WARNING + signal.severityCounts.LOW;
 
   const selectSeverity = useCallback(async (sev) => {
-    if (sev === selectedSev) { setSelectedSev(null); setAlerts([]); setCritSummary(null); setActiveAlert(null); return; }
+    if (sev === selectedSev) { setSelectedSev(null); setAlerts([]); setCritSummary(null); setActiveAlert(null); setShowAlertSituation(false); return; }
     setSelectedSev(sev);
     setActiveAlert(null);
+    setShowAlertSituation(false);
     setAlertLoading(true); setAlertError(null);
     try {
       const params = new URLSearchParams({ signalId: signal._id, severity: sev });
@@ -491,38 +822,61 @@ function SignalDetailScreen({ signal, onBack }) {
             </div>
           )}
 
-          <h3 className="text-sm font-semibold text-gray-700 mb-3">
-            {SEV_META[selectedSev].label} Alerts
-            <span className="text-gray-400 font-normal ml-2">· {signal.severityCounts[selectedSev]}</span>
-          </h3>
+          <div className="flex items-center mb-3">
+            <h3 className="text-sm font-semibold text-gray-700 flex-1">
+              {SEV_META[selectedSev].label} Alerts
+              <span className="text-gray-400 font-normal ml-2">· {signal.severityCounts[selectedSev]}</span>
+            </h3>
+            <button
+              onClick={() => { if (!alertLoading && alerts.length > 0) { setShowAlertSituation(v => !v); setActiveAlert(null); } }}
+              disabled={alertLoading || alerts.length === 0}
+              title={alertLoading ? 'Loading alerts…' : alerts.length === 0 ? 'No alerts to analyse' : 'Toggle alert situation view'}
+              className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full border transition-all ${
+                showAlertSituation
+                  ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                  : alertLoading || alerts.length === 0
+                    ? 'bg-gray-50 text-gray-300 border-gray-200 cursor-not-allowed'
+                    : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50'
+              }`}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M18 20V10M12 20V4M6 20v-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Alert Situation
+            </button>
+          </div>
 
           {alertLoading && <Spinner />}
           {alertError && <ErrorBox msg={alertError} />}
 
-          {/* 2-col layout when history panel is open */}
-          <div className={`${activeAlert ? 'grid gap-4' : ''}`} style={activeAlert ? { gridTemplateColumns: '1fr 420px' } : {}}>
-            <div className="grid grid-cols-1 gap-3 content-start">
-              {!alertLoading && alerts.map(alert => (
-                <AlertTile
-                  key={alert._id}
-                  alert={alert}
-                  onClick={() => handleAlertClick(alert)}
-                  active={activeAlert?._id === alert._id}
-                />
-              ))}
-              {!alertLoading && !alertError && alerts.length === 0 && (
-                <p className="text-sm text-gray-400 py-6 text-center">No alerts found</p>
+          {!alertLoading && !alertError && showAlertSituation ? (
+            <AlertingSituationView key={`${selectedSev}-situation`} alerts={alerts} />
+          ) : (
+            /* 2-col layout when history panel is open */
+            <div className={`${activeAlert ? 'grid gap-4' : ''}`} style={activeAlert ? { gridTemplateColumns: '1fr 420px' } : {}}>
+              <div className="grid grid-cols-1 gap-3 content-start">
+                {!alertLoading && alerts.map(alert => (
+                  <AlertTile
+                    key={alert._id}
+                    alert={alert}
+                    onClick={() => handleAlertClick(alert)}
+                    active={activeAlert?._id === alert._id}
+                  />
+                ))}
+                {!alertLoading && !alertError && alerts.length === 0 && (
+                  <p className="text-sm text-gray-400 py-6 text-center">No alerts found</p>
+                )}
+              </div>
+
+              {/* history panel */}
+              {activeAlert && (
+                <div className="self-start sticky top-4">
+                  <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Alert History</h3>
+                  <HistoryPanel alert={activeAlert} onClose={() => setActiveAlert(null)} />
+                </div>
               )}
             </div>
-
-            {/* history panel */}
-            {activeAlert && (
-              <div className="self-start sticky top-4">
-                <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Alert History</h3>
-                <HistoryPanel alert={activeAlert} onClose={() => setActiveAlert(null)} />
-              </div>
-            )}
-          </div>
+          )}
         </div>
       )}
 
