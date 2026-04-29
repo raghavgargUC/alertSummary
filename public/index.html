@@ -36,7 +36,7 @@
 <div id="root"></div>
 
 <script type="text/babel">
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useCallback, useMemo } = React;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -611,6 +611,87 @@ function TenantAlertsBreakdown({ dates, tenants, byDateTenant }) {
   );
 }
 
+// ── TenantAvgResolutionChart (mean resolution time per tenant code) ───────
+
+function TenantAvgResolutionChart({ events }) {
+  const resolved = (events || []).filter((e) => e.endTime);
+  const byTenant = {};
+  for (const e of resolved) {
+    const t = e.tenantCode || '—';
+    if (!byTenant[t]) byTenant[t] = [];
+    byTenant[t].push(new Date(e.endTime) - new Date(e.startTime));
+  }
+  const rows = Object.entries(byTenant)
+    .map(([tenant, msArr]) => ({
+      tenant,
+      avgMs: msArr.reduce((a, b) => a + b, 0) / msArr.length,
+      count: msArr.length,
+    }))
+    .sort((a, b) => b.avgMs - a.avgMs);
+
+  if (rows.length === 0) {
+    return (
+      <p className="text-sm text-gray-400 py-6 text-center">Nothing cleared in history yet — averages appear after a return to LOW.</p>
+    );
+  }
+
+  const MAX_SHOWN = 24;
+  const shown = rows.slice(0, MAX_SHOWN);
+  const horizHeight = Math.max(180, shown.length * 28 + 40);
+
+  const barData = [{
+    label: 'Avg resolution',
+    data: shown.map((r) => Math.round(r.avgMs / 60000 * 10) / 10),
+    backgroundColor: shown.map((_, i) => PALETTE[i % PALETTE.length] + 'cc'),
+    borderColor: shown.map((_, i) => PALETTE[i % PALETTE.length]),
+    borderWidth: 1,
+    borderRadius: 4,
+  }];
+
+  const barOptions = {
+    indexAxis: 'y',
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          label: (ctx) => {
+            const r = shown[ctx.dataIndex];
+            return ` ${fmtDuration(r.avgMs)} (${r.count} resolved)`;
+          },
+        },
+      },
+    },
+    scales: {
+      x: {
+        beginAtZero: true,
+        title: { display: true, text: 'Minutes (avg)' },
+        grid: { color: '#f3f4f6' },
+      },
+      y: { grid: { display: false }, ticks: { font: { size: 11 } } },
+    },
+  };
+
+  return (
+    <div>
+      <div style={{ height: horizHeight }}>
+        <ChartCanvas
+          key={`res-bar-${shown.map((r) => r.tenant).join(',')}`}
+          type="bar"
+          labels={shown.map((r) => r.tenant)}
+          datasets={barData}
+          chartOptions={barOptions}
+          height={horizHeight}
+        />
+      </div>
+      {rows.length > MAX_SHOWN && (
+        <p className="text-xs text-gray-400 mt-2">Showing top {MAX_SHOWN} tenants by longest avg resolution.</p>
+      )}
+    </div>
+  );
+}
+
 // ── HeatmapGrid ────────────────────────────────────────────────────────────
 
 function HeatmapGrid({ dates, tenants, byDateTenant }) {
@@ -660,7 +741,7 @@ function ResolutionTable({ events }) {
   const [expandedKey, setExpandedKey] = useState(null);
   const byKey = {};
   for (const e of events) {
-    const k = `${e.tenantCode}|||${e.facilityCode}`;
+    const k = `${e.tenantCode}|||${e.facilityCode}|||${e.fingerprint || ''}`;
     if (!byKey[k]) byKey[k] = [];
     byKey[k].push(e);
   }
@@ -668,7 +749,7 @@ function ResolutionTable({ events }) {
   return (
     <div className="space-y-2">
       {keys.map(key => {
-        const [tenantCode, facilityCode] = key.split('|||');
+        const [tenantCode, facilityCode, fingerprint] = key.split('|||');
         const tevents = byKey[key];
         const resolved = tevents.filter(e => e.endTime);
         const ongoing = tevents.filter(e => !e.endTime);
@@ -686,6 +767,12 @@ function ResolutionTable({ events }) {
                 <span className="font-semibold text-gray-800 text-sm">{tenantCode}</span>
                 {facilityCode && facilityCode !== 'undefined' && (
                   <span className="ml-2 text-xs text-gray-500 font-mono bg-gray-100 px-1.5 py-0.5 rounded">{facilityCode}</span>
+                )}
+                {fingerprint && (
+                  <div className="mt-1 text-[10px] font-mono text-gray-600 break-all leading-snug">
+                    <span className="text-gray-400 font-sans font-medium mr-1">Fingerprint</span>
+                    {fingerprint}
+                  </div>
                 )}
               </div>
               <span className="text-xs text-gray-500 shrink-0">{tevents.length} alert{tevents.length !== 1 ? 's' : ''}</span>
@@ -711,6 +798,9 @@ function ResolutionTable({ events }) {
                         style={{ background: m.bg, color: m.color, border: `1px solid ${m.border}` }}>
                         {m.label}
                       </span>
+                      {e.fingerprint && (
+                        <span className="font-mono text-[10px] text-gray-600 max-w-[200px] truncate shrink-0" title={e.fingerprint}>fp {e.fingerprint}</span>
+                      )}
                       <span className="text-gray-500">Started <span className="text-gray-700 font-medium">{fmtTime(e.startTime)}</span></span>
                       {e.endTime
                         ? <span className="text-gray-500">Resolved <span className="text-gray-700 font-medium">{fmtTime(e.endTime)}</span></span>
@@ -731,21 +821,199 @@ function ResolutionTable({ events }) {
   );
 }
 
-// ── AlertingSituationView ──────────────────────────────────────────────────
+// ── Fingerprint tables (alert situation) ───────────────────────────────────
 
-function AlertingSituationView({ alerts }) {
+function latestHistoryEventForAlert(events, alert) {
+  const fp = alert.fingerprint;
+  const list = (events || []).filter(
+    (e) =>
+      e.fingerprint === fp &&
+      e.tenantCode === alert.tenantCode &&
+      e.facilityCode === alert.facilityCode
+  );
+  const ongoing = list.find((e) => !e.endTime);
+  if (ongoing) return ongoing;
+  return list.sort((a, b) => new Date(b.startTime) - new Date(a.startTime))[0] || null;
+}
+
+function isFingerprintSubscribed(alert, subscribedFp) {
+  if (!subscribedFp || alert.fingerprint == null || alert.fingerprint === '') return false;
+  return subscribedFp.has(String(alert.fingerprint).trim());
+}
+
+function SituationFingerprintTables({ activeAlerts, allEvents, subscribedFp }) {
+  const liveRows = [...(activeAlerts || [])].sort((a, b) =>
+    String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''))
+  );
+
+  const orphans =
+    subscribedFp == null
+      ? []
+      : liveRows.filter((a) => !isFingerprintSubscribed(a, subscribedFp)).sort((a, b) =>
+          String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''))
+        );
+
+  const th = 'px-3 py-2 text-left text-[11px] font-bold text-gray-600 uppercase tracking-wide border-b border-gray-200 bg-gray-50';
+  const td = 'px-3 py-2 align-top border-t border-gray-100 text-xs';
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-red-200 bg-white shadow-sm overflow-hidden">
+        <div className="px-4 py-2.5 bg-red-50 border-b border-red-100">
+          <h4 className="text-sm font-bold text-red-900">Live CRITICAL / WARNING (overview)</h4>
+        </div>
+        <div className="overflow-x-auto max-h-72 overflow-y-auto">
+          {liveRows.length === 0 ? (
+            <p className="px-4 py-6 text-sm text-gray-400 text-center">No CRITICAL/WARNING rows in this snapshot.</p>
+          ) : (
+            <table className="min-w-full">
+              <thead>
+                <tr>
+                  <th className={th}>Fingerprint</th>
+                  <th className={th}>Tenant</th>
+                  <th className={th}>Facility</th>
+                  <th className={th}>Severity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {liveRows.map((a, i) => (
+                  <tr key={a._id || `live-${i}-${a.fingerprint}`} className="hover:bg-red-50/40">
+                    <td className={`${td} font-mono text-[11px] text-gray-900 max-w-xs break-all`}>{a.fingerprint || '—'}</td>
+                    <td className={`${td} text-gray-800`}>{a.tenantCode || '—'}</td>
+                    <td className={`${td} font-mono text-gray-600`}>{a.facilityCode || '—'}</td>
+                    <td className={td}><SeverityPill sev={(a.severity || '').toUpperCase()} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-amber-200 bg-white shadow-sm overflow-hidden">
+        <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-100">
+          <h4 className="text-sm font-bold text-amber-900">Not in subscription config (fingerprint)</h4>
+        </div>
+        <div className="overflow-x-auto max-h-72 overflow-y-auto">
+          {subscribedFp == null ? (
+            <p className="px-4 py-6 text-sm text-amber-700 text-center">Loading subscription fingerprints…</p>
+          ) : orphans.length === 0 ? (
+            <p className="px-4 py-6 text-sm text-gray-400 text-center">
+              No orphans — every active-alert fingerprint appears in signal_subscription_config (or there are no CRITICAL/WARNING rows).
+            </p>
+          ) : (
+            <table className="min-w-full">
+              <thead>
+                <tr>
+                  <th className={th}>Fingerprint</th>
+                  <th className={th}>Tenant</th>
+                  <th className={th}>Facility</th>
+                  <th className={th}>Severity</th>
+                  <th className={th}>Start (history)</th>
+                  <th className={th}>Resolve (history)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orphans.map((a, i) => {
+                  const ep = latestHistoryEventForAlert(allEvents, a);
+                  return (
+                    <tr key={a._id || `orph-${i}-${a.fingerprint}`} className="hover:bg-amber-50/50">
+                      <td className={`${td} font-mono text-[11px] text-gray-900 max-w-xs break-all`}>{a.fingerprint || '—'}</td>
+                      <td className={`${td} text-gray-800`}>{a.tenantCode || '—'}</td>
+                      <td className={`${td} font-mono text-gray-600`}>{a.facilityCode || '—'}</td>
+                      <td className={td}><SeverityPill sev={(a.severity || '').toUpperCase()} /></td>
+                      <td className={`${td} text-gray-700 whitespace-nowrap`}>{ep ? fmtTime(ep.startTime) : '—'}</td>
+                      <td className={td}>
+                        {ep && !ep.endTime && <span className="text-red-600 font-semibold">Ongoing</span>}
+                        {ep && ep.endTime && <span className="text-gray-700 whitespace-nowrap">{fmtTime(ep.endTime)}</span>}
+                        {!ep && <span className="text-gray-400">No history yet</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── AlertingSituationView ──────────────────────────────────────────────────
+// Total alert = CRITICAL/WARNING rows + LOW rows in overview with same tenant · facility · signalId.
+// History fetched for CRITICAL/WARNING fingerprints. Orphans = not in signal_subscription_config.
+
+function AlertingSituationView({ signalId, alerts }) {
+  const activeAlerts = useMemo(() => {
+    return (alerts || []).filter((a) => {
+      const s = (a.severity || '').toUpperCase();
+      return s === 'CRITICAL' || s === 'WARNING';
+    });
+  }, [alerts]);
+
+  const siteKeysFromActive = useMemo(() => {
+    const set = new Set();
+    for (const a of activeAlerts) {
+      set.add(`${a.tenantCode ?? ''}|${a.facilityCode ?? ''}|${a.signalId ?? ''}`);
+    }
+    return set;
+  }, [activeAlerts]);
+
+  const extraLowOverviewRows = useMemo(() => {
+    let n = 0;
+    for (const a of alerts || []) {
+      if ((a.severity || '').toUpperCase() !== 'LOW') continue;
+      const k = `${a.tenantCode ?? ''}|${a.facilityCode ?? ''}|${a.signalId ?? ''}`;
+      if (siteKeysFromActive.has(k)) n += 1;
+    }
+    return n;
+  }, [alerts, siteKeysFromActive]);
+
+  const totalAlertCount = activeAlerts.length + extraLowOverviewRows;
+
+  const [subscribedFp, setSubscribedFp] = useState(null);
   const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState(0);
 
   useEffect(() => {
+    if (!signalId) {
+      setSubscribedFp(new Set());
+      return undefined;
+    }
     let cancelled = false;
+    setSubscribedFp(null);
+    apiFetch(`/api/signals/${signalId}/subscription-fingerprints`)
+      .then((r) => {
+        if (!cancelled) setSubscribedFp(new Set(r.data || []));
+      })
+      .catch(() => {
+        if (!cancelled) setSubscribedFp(new Set());
+      });
+    return () => { cancelled = true; };
+  }, [signalId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setAllEvents([]);
+    setProgress(0);
+    if (!activeAlerts || activeAlerts.length === 0) {
+      setLoading(false);
+      return () => { cancelled = true; };
+    }
+    const list = activeAlerts.filter((a) => a.fingerprint);
+    if (list.length === 0) {
+      setLoading(false);
+      return () => { cancelled = true; };
+    }
+    const total = list.length;
     let done = 0;
-    const total = alerts.length;
-    setLoading(true); setError(null); setAllEvents([]); setProgress(0);
     Promise.all(
-      alerts.map(async (alert) => {
+      list.map(async (alert) => {
         try {
           const data = await apiFetch(`/api/alerts/${alert.fingerprint}/history`);
           const history = data.data || data || [];
@@ -753,37 +1021,63 @@ function AlertingSituationView({ alerts }) {
           done++;
           if (!cancelled) setProgress(Math.round((done / total) * 100));
           return events;
-        } catch { done++; return []; }
+        } catch {
+          done++;
+          if (!cancelled) setProgress(Math.round((done / total) * 100));
+          return [];
+        }
       })
-    ).then(results => {
-      if (!cancelled) { setAllEvents(results.flat()); setLoading(false); }
-    }).catch(e => {
-      if (!cancelled) { setError(e.message); setLoading(false); }
+    ).then((results) => {
+      if (!cancelled) {
+        setAllEvents(results.flat());
+        setLoading(false);
+      }
+    }).catch((e) => {
+      if (!cancelled) {
+        setError(e.message);
+        setLoading(false);
+      }
     });
     return () => { cancelled = true; };
-  }, [alerts]);
+  }, [activeAlerts]);
 
   const tenantFacilityKey = (e) => `${e.tenantCode} / ${e.facilityCode}`;
+  const tenantCodeKey = (e) => e.tenantCode || '—';
+
   const tenants = [...new Set(allEvents.map(tenantFacilityKey))].sort();
+  const tenantsByCode = [...new Set(allEvents.map(tenantCodeKey))].sort();
+
   const byDateTenant = {};
+  const byDateTenantCode = {};
   for (const e of allEvents) {
     const date = e.startTime ? e.startTime.substring(0, 10) : 'unknown';
-    const key = tenantFacilityKey(e);
+    const tf = tenantFacilityKey(e);
+    const tc = tenantCodeKey(e);
     if (!byDateTenant[date]) byDateTenant[date] = {};
-    byDateTenant[date][key] = (byDateTenant[date][key] || 0) + 1;
+    byDateTenant[date][tf] = (byDateTenant[date][tf] || 0) + 1;
+    if (!byDateTenantCode[date]) byDateTenantCode[date] = {};
+    byDateTenantCode[date][tc] = (byDateTenantCode[date][tc] || 0) + 1;
   }
   const dates = Object.keys(byDateTenant).sort();
 
-  const resolved = allEvents.filter(e => e.endTime);
-  const ongoing = allEvents.filter(e => !e.endTime);
+  const resolved = allEvents.filter((e) => e.endTime);
   const avgResolutionMs = resolved.length > 0
     ? resolved.reduce((s, e) => s + (new Date(e.endTime) - new Date(e.startTime)), 0) / resolved.length
     : null;
 
+  let critLive = 0;
+  let warnLive = 0;
+  for (const a of activeAlerts) {
+    const s = (a.severity || '').toUpperCase();
+    if (s === 'CRITICAL') critLive++;
+    else if (s === 'WARNING') warnLive++;
+  }
+  const liveBreaching = critLive + warnLive;
+
   const chart3Labels = dates;
   const chart3Datasets = [{
-    label: 'Total Alerts',
-    data: dates.map(d => Object.values(byDateTenant[d]).reduce((s, v) => s + v, 0)),
+    label: 'New escalations per day',
+    data: dates.map((d) => Object.values(byDateTenant[d] || {}).reduce((s, v) => s + v, 0)),
     fill: true,
     backgroundColor: 'rgba(59,130,246,0.12)',
     borderColor: '#3b82f6',
@@ -793,63 +1087,93 @@ function AlertingSituationView({ alerts }) {
     pointBackgroundColor: '#3b82f6',
   }];
 
-  if (loading) return (
-    <div className="py-12 text-center fade-in">
-      <Spinner />
-      <p className="text-sm text-gray-400 mt-3">Fetching alert histories… {progress}%</p>
-      <div className="w-48 h-1.5 bg-gray-200 rounded-full mx-auto mt-2">
-        <div className="h-full bg-blue-500 rounded-full transition-all duration-300" style={{ width: `${progress}%` }} />
+  if (loading) {
+    return (
+      <div className="py-10 text-center fade-in">
+        <Spinner />
+        <p className="text-sm text-gray-600 mt-3">Loading… {progress}%</p>
+        <div className="w-56 h-1.5 bg-gray-200 rounded-full mx-auto mt-3">
+          <div className="h-full bg-blue-500 rounded-full transition-all duration-300" style={{ width: `${progress}%` }} />
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
 
-  if (error) return <ErrorBox msg={error} />;
+  if (error) {
+    return <ErrorBox msg={error} />;
+  }
 
   return (
     <div className="space-y-5 fade-in">
-      {/* Summary */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {[
-          { label: 'Total Alert Events', value: allEvents.length, color: '#111827' },
-          { label: 'Ongoing', value: ongoing.length, color: '#dc2626' },
-          { label: 'Resolved', value: resolved.length, color: '#059669' },
-          { label: 'Avg Resolution', value: avgResolutionMs != null ? fmtDuration(avgResolutionMs) : '—', color: '#6b7280' },
-        ].map(({ label, value, color }) => (
-          <div key={label} className="rounded-lg border border-gray-200 bg-white px-4 py-3 text-center">
-            <p className="text-xs text-gray-400 mb-1">{label}</p>
-            <p className="text-2xl font-bold" style={{ color }}>{value}</p>
+          {
+            label: 'Total alert',
+            sub: `${activeAlerts.length} live + ${extraLowOverviewRows} LOW (same tenant · facility · signal)`,
+            value: totalAlertCount,
+            color: '#0f172a',
+            bg: 'bg-slate-50',
+            border: 'border-slate-200',
+          },
+          { label: 'Live alert', sub: `${critLive} Critical · ${warnLive} Warning`, value: liveBreaching, color: '#b91c1c', bg: 'bg-red-50/90', border: 'border-red-200' },
+          { label: 'Avg. time to clear', sub: 'For cleared only', value: avgResolutionMs != null ? fmtDuration(avgResolutionMs) : '—', color: '#0e7490', bg: 'bg-cyan-50/90', border: 'border-cyan-200' },
+        ].map((c) => (
+          <div key={c.label} className={`rounded-xl border ${c.border} ${c.bg} px-3 py-3 text-left shadow-sm`}>
+            <p className="text-[10px] sm:text-xs text-gray-500 font-semibold leading-tight">{c.label}</p>
+            <p className="text-xs text-gray-400 mt-0.5 mb-1">{c.sub}</p>
+            <p className="text-2xl sm:text-3xl font-black tabular-nums tracking-tight" style={{ color: c.color }}>{c.value}</p>
           </div>
         ))}
       </div>
 
+      {alerts && alerts.length > 0 && (
+        <SituationFingerprintTables
+          activeAlerts={activeAlerts}
+          allEvents={allEvents}
+          subscribedFp={subscribedFp}
+        />
+      )}
+
       {allEvents.length === 0 ? (
-        <div className="text-center py-10 text-sm text-gray-400 bg-white rounded-lg border border-gray-200">
-          No alert events detected.<br />
-          <span className="text-xs">Alert events are state transitions: LOW → CRITICAL or LOW → WARNING.</span>
+        <div className="text-center py-12 text-sm text-gray-500 bg-white rounded-xl border border-gray-200">
+          <p className="font-medium text-gray-700">No history loaded yet for live CRITICAL/WARNING fingerprints</p>
+          <p className="text-xs text-gray-400 mt-2 max-w-md mx-auto">Charts appear after history returns escalations for those rows. Overview tables above still show the current snapshot.</p>
         </div>
       ) : (
         <>
-          {/* Chart: Aggregated time-wise */}
-          <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Aggregated Alerts Over Time</h4>
+          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <h4 className="text-sm font-bold text-gray-800 mb-1">New escalations per day</h4>
+            <p className="text-xs text-gray-500 mb-3">Aggregated across tenant/facility streams for this signal.</p>
             <ChartCanvas key={`agg-${chart3Labels.join(',')}`} type="line" labels={chart3Labels} datasets={chart3Datasets} />
           </div>
 
-          {/* Chart: Tenant/Facility ranked + drill-down trend */}
-          <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant / Facility Alert Breakdown</h4>
+          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <h4 className="text-sm font-bold text-gray-800 mb-1">By tenant code</h4>
+            <p className="text-xs text-gray-500 mb-3">Aggregated by tenant (all facilities); click a bar for daily trend.</p>
+            <TenantAlertsBreakdown dates={dates} tenants={tenantsByCode} byDateTenant={byDateTenantCode} />
+          </div>
+
+          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <h4 className="text-sm font-bold text-gray-800 mb-1">By tenant &amp; facility</h4>
+            <p className="text-xs text-gray-500 mb-3">Per-site counts; click a bar to drill the daily trend.</p>
             <TenantAlertsBreakdown dates={dates} tenants={tenants} byDateTenant={byDateTenant} />
           </div>
 
-          {/* Heatmap */}
-          <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Tenant / Facility × Date Heatmap</h4>
+          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <h4 className="text-sm font-bold text-gray-800 mb-1">Activity heatmap (tenant / facility)</h4>
+            <p className="text-xs text-gray-500 mb-3">Darker = more alerts that day for that site.</p>
             <HeatmapGrid dates={dates} tenants={tenants} byDateTenant={byDateTenant} />
           </div>
 
-          {/* Resolution times per tenant/facility */}
+          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <h4 className="text-sm font-bold text-gray-800 mb-1">Avg time to clear by tenant</h4>
+            <p className="text-xs text-gray-500 mb-3">Mean duration from escalation start to LOW (cleared only), by tenant code.</p>
+            <TenantAvgResolutionChart events={allEvents} />
+          </div>
+
           <div>
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Resolution Times by Tenant / Facility</h4>
+            <h4 className="text-sm font-bold text-gray-800 mb-1">Time to clear &amp; ongoing — by tenant, facility &amp; fingerprint</h4>
+            <p className="text-xs text-gray-500 mb-3">One row per fingerprint stream. Expand for timestamps.</p>
             <ResolutionTable events={allEvents} />
           </div>
         </>
@@ -882,13 +1206,8 @@ function SignalDetailScreen({ signal, onBack }) {
     if (allAlerts !== null) return; // already fetched
     setAllAlertsLoading(true); setAllAlertsError(null);
     try {
-      const results = await Promise.all(
-        ['CRITICAL', 'WARNING', 'LOW'].map(sev =>
-          apiFetch(`/api/alerts?${new URLSearchParams({ signalId: signal._id, severity: sev })}`)
-            .then(r => r.data || []).catch(() => [])
-        )
-      );
-      setAllAlerts(results.flat());
+      const { data } = await apiFetch(`/api/alerts?${new URLSearchParams({ signalId: signal._id })}`);
+      setAllAlerts(data || []);
     } catch (e) { setAllAlertsError(e.message); }
     finally { setAllAlertsLoading(false); }
   }, [showSituation, allAlerts, signal._id]);
@@ -932,9 +1251,6 @@ function SignalDetailScreen({ signal, onBack }) {
             <path d="M18 20V10M12 20V4M6 20v-6" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           Alert Situation
-          {showSituation && (
-            <span className="ml-1 text-xs font-normal opacity-80">· all severities</span>
-          )}
         </button>
       </div>
 
@@ -949,7 +1265,7 @@ function SignalDetailScreen({ signal, onBack }) {
           )}
           {allAlertsError && <ErrorBox msg={allAlertsError} />}
           {!allAlertsLoading && !allAlertsError && allAlerts !== null && (
-            <AlertingSituationView key="global-situation" alerts={allAlerts} />
+            <AlertingSituationView key="global-situation" signalId={signal._id} alerts={allAlerts} />
           )}
         </div>
       )}
