@@ -506,6 +506,94 @@ app.post('/api/alerts/histories', asyncRoute('/api/alerts/histories', async (req
   res.json({ histories, errors });
 }));
 
+/**
+ * LOW-state alert_overview rows at subscribed (tenant, facility) sites for a
+ * signal — same scope as the Alert Situation "LOW (same tenant · facility · signal)" KPI.
+ * Returns distinct fingerprints with tenant/facility for stitching histories client-side.
+ */
+async function loadLowStreamSituationContexts(signalId, sites) {
+  const sid = String(signalId ?? '').trim();
+  const pairs = (sites || [])
+    .map((s) => ({
+      tenantCode: String(s.tenantCode || '').trim(),
+      facilityCode: String(s.facilityCode || '').trim(),
+    }))
+    .filter((s) => s.tenantCode && s.facilityCode);
+  if (!sid || pairs.length === 0) return [];
+
+  const stages = [
+    { $match: {
+      $and: [
+        { $or: [{ signalId: sid }, { signalId: signalId }] },
+        { severity: 'LOW' },
+        { $or: pairs.map((p) => ({ tenantCode: p.tenantCode, facilityCode: p.facilityCode })) },
+      ],
+    } },
+    ...activeSubscriptionFilter(),
+    { $match: { fingerprint: { $exists: true, $nin: [null, ''] } } },
+    { $group: {
+      _id: '$fingerprint',
+      tenantCode: { $first: '$tenantCode' },
+      facilityCode: { $first: '$facilityCode' },
+    } },
+    { $project: { _id: 0, fingerprint: '$_id', tenantCode: 1, facilityCode: 1 } },
+    { $limit: 250 },
+  ];
+  return db.collection('alert_overview').aggregate(stages).toArray();
+}
+
+/**
+ * POST /api/alerts/histories-situation
+ *
+ * Same batched upstream history fetch as /api/alerts/histories, optionally unioning
+ * LOW-only fingerprint streams at the given sites (see loadLowStreamSituationContexts).
+ *
+ * Body: {
+ *   fingerprints: string[],
+ *   signalId?: string,
+ *   includeLowStreams?: boolean,
+ *   sites?: { tenantCode, facilityCode }[]
+ * }
+ * Returns: { histories, errors, lowStreamContexts?: { fingerprint, tenantCode, facilityCode }[] }
+ */
+app.post('/api/alerts/histories-situation', asyncRoute('/api/alerts/histories-situation', async (req, res) => {
+  const raw = Array.isArray(req.body?.fingerprints) ? req.body.fingerprints : [];
+  let list = [...new Set(raw.filter((s) => typeof s === 'string' && s.length > 0))];
+
+  const signalId = req.body?.signalId;
+  const includeLowStreams = Boolean(req.body?.includeLowStreams);
+  const sites = Array.isArray(req.body?.sites) ? req.body.sites : [];
+
+  let lowStreamContexts = [];
+  if (includeLowStreams && signalId) {
+    lowStreamContexts = await loadLowStreamSituationContexts(signalId, sites);
+    const have = new Set(list);
+    for (const row of lowStreamContexts) {
+      const fp = row.fingerprint != null ? String(row.fingerprint).trim() : '';
+      if (fp && !have.has(fp)) {
+        have.add(fp);
+        list.push(fp);
+      }
+    }
+  }
+
+  list = list.slice(0, 500);
+  if (list.length === 0) {
+    return res.json({ histories: {}, errors: {}, lowStreamContexts });
+  }
+
+  const results = await pMapWithLimit(list, 20, fetchUpstreamHistory);
+
+  const histories = {};
+  const errors = {};
+  list.forEach((fp, i) => {
+    const r = results[i];
+    if (r?.ok) histories[fp] = r.value;
+    else errors[fp] = r?.error || 'unknown error';
+  });
+  res.json({ histories, errors, lowStreamContexts });
+}));
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Impact analysis (business-facing)
 // ═════════════════════════════════════════════════════════════════════════════

@@ -1179,8 +1179,40 @@ function SituationFingerprintTables({ activeAlerts }) {
 }
 
 // ── AlertingSituationView ──────────────────────────────────────────────────
-// Total alert = CRITICAL/WARNING rows + LOW rows in overview with same tenant · facility · signalId.
-// History fetched for CRITICAL/WARNING fingerprints.
+// History stitched from CRITICAL/WARNING fingerprints; optional union with LOW-only streams at same sites.
+
+/** Unique { tenantCode, facilityCode } from live bad alerts (situation request scope). */
+function buildSituationSitesFromActiveAlerts(activeAlerts) {
+  const out = [];
+  const seen = new Set();
+  for (const a of activeAlerts || []) {
+    const t = a.tenantCode;
+    const f = a.facilityCode;
+    if (!t || !f) continue;
+    const k = `${t}|${f}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ tenantCode: t, facilityCode: f });
+  }
+  return out;
+}
+
+/**
+ * Batched histories for the situation chart, optionally including LOW-only streams
+ * at the same sites (server merges DB fingerprints — see /api/alerts/histories-situation).
+ */
+async function fetchHistoriesForAlertingSituation({ activeAlerts, signalId, includeLowStreams }) {
+  const list = (activeAlerts || []).filter((a) => a.fingerprint);
+  const fingerprints = list.map((a) => a.fingerprint);
+  const sites = buildSituationSitesFromActiveAlerts(activeAlerts);
+  const res = await fetch('/api/alerts/histories-situation', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fingerprints, signalId, includeLowStreams, sites }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
 
 function AlertingSituationView({ signalId, alerts }) {
   const activeAlerts = useMemo(() => {
@@ -1190,30 +1222,11 @@ function AlertingSituationView({ signalId, alerts }) {
     });
   }, [alerts]);
 
-  const siteKeysFromActive = useMemo(() => {
-    const set = new Set();
-    for (const a of activeAlerts) {
-      set.add(`${a.tenantCode ?? ''}|${a.facilityCode ?? ''}|${a.signalId ?? ''}`);
-    }
-    return set;
-  }, [activeAlerts]);
-
-  const extraLowOverviewRows = useMemo(() => {
-    let n = 0;
-    for (const a of alerts || []) {
-      if ((a.severity || '').toUpperCase() !== 'LOW') continue;
-      const k = `${a.tenantCode ?? ''}|${a.facilityCode ?? ''}|${a.signalId ?? ''}`;
-      if (siteKeysFromActive.has(k)) n += 1;
-    }
-    return n;
-  }, [alerts, siteKeysFromActive]);
-
-  const totalAlertCount = activeAlerts.length + extraLowOverviewRows;
-
   const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState(0);
+  const [includeLowStreams, setIncludeLowStreams] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1222,33 +1235,35 @@ function AlertingSituationView({ signalId, alerts }) {
     setAllEvents([]);
     setProgress(0);
 
-    const list = (activeAlerts || []).filter((a) => a.fingerprint);
-    if (list.length === 0) {
+    const activeWithFp = (activeAlerts || []).filter((a) => a.fingerprint);
+    if (activeWithFp.length === 0) {
       setLoading(false);
       return () => { cancelled = true; };
     }
 
-    // One batched POST instead of N parallel GETs. The browser caps concurrent
-    // connections to a single origin (~6 for HTTP/1.1) — server-side fan-out
-    // hits the upstream API with a higher concurrency cap and returns one
-    // combined payload. Typically 3–5× faster than the per-fingerprint loop.
-    const fingerprints = list.map((a) => a.fingerprint);
     setProgress(0);
-    fetch('/api/alerts/histories', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fingerprints }),
+    fetchHistoriesForAlertingSituation({
+      activeAlerts: activeWithFp,
+      signalId,
+      includeLowStreams,
     })
-      .then((res) => {
-        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        return res.json();
-      })
-      .then(({ histories = {}, errors = {} }) => {
+      .then(({ histories = {}, errors = {}, lowStreamContexts = [] }) => {
         if (cancelled) return;
         const events = [];
-        for (const a of list) {
+        const ctxByFp = new Map();
+        for (const a of activeWithFp) ctxByFp.set(a.fingerprint, a);
+        for (const row of lowStreamContexts) {
+          const fp = row.fingerprint != null ? String(row.fingerprint).trim() : '';
+          if (!fp || ctxByFp.has(fp)) continue;
+          ctxByFp.set(fp, {
+            fingerprint: fp,
+            tenantCode: row.tenantCode,
+            facilityCode: row.facilityCode,
+          });
+        }
+        for (const a of ctxByFp.values()) {
           const h = histories[a.fingerprint];
-          if (!h) continue; // missing or upstream-failed; skip
+          if (!h) continue;
           const arr = Array.isArray(h) ? h : (h.data || []);
           events.push(...deriveAlertEvents(a.fingerprint, a.tenantCode, a.facilityCode, arr));
         }
@@ -1266,7 +1281,7 @@ function AlertingSituationView({ signalId, alerts }) {
       });
 
     return () => { cancelled = true; };
-  }, [activeAlerts]);
+  }, [activeAlerts, signalId, includeLowStreams]);
 
   const tenantFacilityKey = (e) => `${e.tenantCode} / ${e.facilityCode}`;
   const tenantCodeKey = (e) => e.tenantCode || '—';
@@ -1380,6 +1395,7 @@ function AlertingSituationView({ signalId, alerts }) {
       }
     } else if (chartCut === 'lifecycle') {
       for (const e of allEvents) addPoint(e.startTime, 'Escalated');
+      for (const e of allEvents) if (e.endTime) addPoint(e.startTime, 'Start (resolved)');
       for (const e of allEvents) if (e.endTime) addPoint(e.endTime, 'Resolved');
     }
 
@@ -1392,7 +1408,7 @@ function AlertingSituationView({ signalId, alerts }) {
       const order = ['CRITICAL', 'WARNING', 'LOW', 'OTHER'];
       series.sort((a, b) => order.indexOf(a) - order.indexOf(b));
     } else if (chartCut === 'lifecycle') {
-      series = ['Escalated', 'Resolved'].filter((s) => seriesSet.has(s));
+      series = ['Escalated', 'Start (resolved)', 'Resolved'].filter((s) => seriesSet.has(s));
     } else if (chartCut === 'tenant') {
       series.sort((a, b) => {
         if (a === 'Other') return 1;
@@ -1410,6 +1426,7 @@ function AlertingSituationView({ signalId, alerts }) {
       }
       if (chartCut === 'lifecycle') {
         if (name === 'Escalated') return '#dc2626';
+        if (name === 'Start (resolved)') return '#7c3aed';
         if (name === 'Resolved') return '#16a34a';
       }
       if (chartCut === 'total') return '#3b82f6';
@@ -1541,17 +1558,11 @@ function AlertingSituationView({ signalId, alerts }) {
       </div>
 
       {/* Lifecycle row — events & resolution performance */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         <KpiTile
           label="Total alarm events"
           value={allEvents.length}
           sub={`${resolved.length} cleared · ${ongoing.length} ongoing`}
-          accent="#0f172a"
-        />
-        <KpiTile
-          label="Total alert (snapshot)"
-          value={totalAlertCount}
-          sub={`${activeAlerts.length} live + ${extraLowOverviewRows} LOW (same tenant · facility · signal)`}
           accent="#0f172a"
         />
         <KpiTile
@@ -1649,10 +1660,10 @@ function AlertingSituationView({ signalId, alerts }) {
                   {chartCut === 'total' && 'Aggregated across tenant/facility streams for this signal.'}
                   {chartCut === 'severity' && 'Split by severity at the moment of escalation.'}
                   {chartCut === 'tenant' && 'Stacked by top 5 tenants (rest grouped as "Other").'}
-                  {chartCut === 'lifecycle' && 'Escalations vs resolutions — when alarms started vs cleared.'}
+                  {chartCut === 'lifecycle' && 'Escalations vs resolutions — alarm starts, starts of now-cleared episodes, and clear times.'}
                 </p>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2 justify-end flex-1 min-w-0">
                 <div className="inline-flex rounded-md border border-gray-200 bg-gray-50 p-0.5 text-xs font-semibold">
                   {[{k:'day',l:'Day'},{k:'hour',l:'Hour'}].map((o) => (
                     <button key={o.k} onClick={() => setChartGran(o.k)}
@@ -1673,6 +1684,24 @@ function AlertingSituationView({ signalId, alerts }) {
                       {o.l}
                     </button>
                   ))}
+                </div>
+                <div className="flex flex-col items-stretch gap-1 sm:items-end w-full sm:w-auto sm:min-w-[11rem]">
+                  <span className="text-[11px] font-bold uppercase tracking-wide text-gray-600 sm:text-right">
+                    LOW snapshot rows
+                  </span>
+                  <button
+                    type="button"
+                    aria-pressed={includeLowStreams}
+                    title="When on, also loads upstream histories for LOW-only alert rows at the same tenant, facility, and signal."
+                    onClick={() => setIncludeLowStreams((v) => !v)}
+                    className={`rounded-lg border-2 px-3 py-2 text-sm font-bold text-left sm:text-right shadow-sm transition-colors ${
+                      includeLowStreams
+                        ? 'border-violet-500 bg-violet-100 text-violet-950 ring-1 ring-violet-200'
+                        : 'border-gray-300 bg-gray-100 text-gray-900 hover:border-gray-400 hover:bg-gray-50'
+                    }`}
+                  >
+                    {includeLowStreams ? 'On — include LOW streams' : 'Off — CRIT/WARN only'}
+                  </button>
                 </div>
               </div>
             </div>
