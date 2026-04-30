@@ -637,7 +637,12 @@ function HistoryPanel({ alert, onClose }) {
     (async () => {
       setLoading(true); setError(null);
       try {
-        const data = await apiFetch(`/api/alerts/${alert.fingerprint}/history`);
+        const qs = new URLSearchParams({
+          tenantCode: alert.tenantCode || '',
+          facilityCode: alert.facilityCode || '',
+          signalId: String(alert.signalId || ''),
+        });
+        const data = await apiFetch(`/api/alerts/overview-timeline?${qs}`);
         if (!cancelled) setHistory(data.data || data || []);
       } catch (e) {
         if (!cancelled) setError(e.message);
@@ -646,7 +651,7 @@ function HistoryPanel({ alert, onClose }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [alert.fingerprint]);
+  }, [alert.tenantCode, alert.facilityCode, alert.signalId]);
 
   const alertSev = (alert.severity || '').toUpperCase();
   const alertMeta = SEV_META[alertSev] || SEV_META.LOW;
@@ -1037,24 +1042,6 @@ function ResolutionTable({ events }) {
 
 // ── Fingerprint tables (alert situation) ───────────────────────────────────
 
-function latestHistoryEventForAlert(events, alert) {
-  const fp = alert.fingerprint;
-  const list = (events || []).filter(
-    (e) =>
-      e.fingerprint === fp &&
-      e.tenantCode === alert.tenantCode &&
-      e.facilityCode === alert.facilityCode
-  );
-  const ongoing = list.find((e) => !e.endTime);
-  if (ongoing) return ongoing;
-  return list.sort((a, b) => new Date(b.startTime) - new Date(a.startTime))[0] || null;
-}
-
-function isFingerprintSubscribed(alert, subscribedFp) {
-  if (!subscribedFp || alert.fingerprint == null || alert.fingerprint === '') return false;
-  return subscribedFp.has(String(alert.fingerprint).trim());
-}
-
 /**
  * Show the cube / alert-condition payload for a single alert_overview row.
  * Two views: a quick "headline + metric chips + key fields" summary, and the
@@ -1120,17 +1107,10 @@ function AlertConditionPayload({ alert }) {
   );
 }
 
-function SituationFingerprintTables({ activeAlerts, allEvents, subscribedFp }) {
+function SituationFingerprintTables({ activeAlerts }) {
   const liveRows = [...(activeAlerts || [])].sort((a, b) =>
     String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''))
   );
-
-  const orphans =
-    subscribedFp == null
-      ? []
-      : liveRows.filter((a) => !isFingerprintSubscribed(a, subscribedFp)).sort((a, b) =>
-          String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''))
-        );
 
   // Track which live row is expanded to show its alert-condition JSON.
   const [expandedKey, setExpandedKey] = useState(null);
@@ -1140,8 +1120,7 @@ function SituationFingerprintTables({ activeAlerts, allEvents, subscribedFp }) {
   const td = 'px-3 py-2 align-top border-t border-gray-100 text-xs';
 
   return (
-    <div className="space-y-4">
-      <div className="rounded-xl border border-red-200 bg-white shadow-sm overflow-hidden">
+    <div className="rounded-xl border border-red-200 bg-white shadow-sm overflow-hidden">
         <div className="px-4 py-2.5 bg-red-50 border-b border-red-100 flex items-baseline justify-between">
           <h4 className="text-sm font-bold text-red-900">Live CRITICAL / WARNING (overview)</h4>
           <span className="text-[11px] text-red-700/70">Click a row to inspect its alert-condition payload</span>
@@ -1195,61 +1174,13 @@ function SituationFingerprintTables({ activeAlerts, allEvents, subscribedFp }) {
             </table>
           )}
         </div>
-      </div>
-
-      <div className="rounded-xl border border-amber-200 bg-white shadow-sm overflow-hidden">
-        <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-100">
-          <h4 className="text-sm font-bold text-amber-900">Not in subscription config (fingerprint)</h4>
-        </div>
-        <div className="overflow-x-auto max-h-72 overflow-y-auto">
-          {subscribedFp == null ? (
-            <p className="px-4 py-6 text-sm text-amber-700 text-center">Loading subscription fingerprints…</p>
-          ) : orphans.length === 0 ? (
-            <p className="px-4 py-6 text-sm text-gray-400 text-center">
-              No orphans — every active-alert fingerprint appears in signal_subscription_config (or there are no CRITICAL/WARNING rows).
-            </p>
-          ) : (
-            <table className="min-w-full">
-              <thead>
-                <tr>
-                  <th className={th}>Fingerprint</th>
-                  <th className={th}>Tenant</th>
-                  <th className={th}>Facility</th>
-                  <th className={th}>Severity</th>
-                  <th className={th}>Start (history)</th>
-                  <th className={th}>Resolve (history)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orphans.map((a, i) => {
-                  const ep = latestHistoryEventForAlert(allEvents, a);
-                  return (
-                    <tr key={a._id || `orph-${i}-${a.fingerprint}`} className="hover:bg-amber-50/50">
-                      <td className={`${td} font-mono text-[11px] text-gray-900 max-w-xs break-all`}>{a.fingerprint || '—'}</td>
-                      <td className={`${td} text-gray-800`}>{a.tenantCode || '—'}</td>
-                      <td className={`${td} font-mono text-gray-600`}>{a.facilityCode || '—'}</td>
-                      <td className={td}><SeverityPill sev={(a.severity || '').toUpperCase()} /></td>
-                      <td className={`${td} text-gray-700 whitespace-nowrap`}>{ep ? fmtTime(ep.startTime) : '—'}</td>
-                      <td className={td}>
-                        {ep && !ep.endTime && <span className="text-red-600 font-semibold">Ongoing</span>}
-                        {ep && ep.endTime && <span className="text-gray-700 whitespace-nowrap">{fmtTime(ep.endTime)}</span>}
-                        {!ep && <span className="text-gray-400">No history yet</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div>
     </div>
   );
 }
 
 // ── AlertingSituationView ──────────────────────────────────────────────────
 // Total alert = CRITICAL/WARNING rows + LOW rows in overview with same tenant · facility · signalId.
-// History fetched for CRITICAL/WARNING fingerprints. Orphans = not in signal_subscription_config.
+// History fetched for CRITICAL/WARNING fingerprints.
 
 function AlertingSituationView({ signalId, alerts }) {
   const activeAlerts = useMemo(() => {
@@ -1279,28 +1210,10 @@ function AlertingSituationView({ signalId, alerts }) {
 
   const totalAlertCount = activeAlerts.length + extraLowOverviewRows;
 
-  const [subscribedFp, setSubscribedFp] = useState(null);
   const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState(0);
-
-  useEffect(() => {
-    if (!signalId) {
-      setSubscribedFp(new Set());
-      return undefined;
-    }
-    let cancelled = false;
-    setSubscribedFp(null);
-    apiFetch(`/api/signals/${signalId}/subscription-fingerprints`)
-      .then((r) => {
-        if (!cancelled) setSubscribedFp(new Set(r.data || []));
-      })
-      .catch(() => {
-        if (!cancelled) setSubscribedFp(new Set());
-      });
-    return () => { cancelled = true; };
-  }, [signalId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1718,11 +1631,7 @@ function AlertingSituationView({ signalId, alerts }) {
       )}
 
       {alerts && alerts.length > 0 && (
-        <SituationFingerprintTables
-          activeAlerts={activeAlerts}
-          allEvents={allEvents}
-          subscribedFp={subscribedFp}
-        />
+        <SituationFingerprintTables activeAlerts={activeAlerts} />
       )}
 
       {allEvents.length === 0 ? (

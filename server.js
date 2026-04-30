@@ -345,6 +345,90 @@ app.get('/api/alerts', asyncRoute('/api/alerts', async (req, res) => {
   res.json({ data: rawAlerts.map(alertToDTO), summary });
 }));
 
+/** Normalize upstream GET /alerts/:fingerprint/history response body to an array. */
+function upstreamHistoryToArray(body) {
+  if (Array.isArray(body)) return body;
+  if (body && Array.isArray(body.data)) return body.data;
+  return [];
+}
+
+/**
+ * GET /api/alerts/overview-timeline?tenantCode=&facilityCode=&signalId=
+ *
+ * 1) Load all matching alert_overview rows (active subscription only).
+ * 2) Collect distinct fingerprints.
+ * 3) For each fingerprint, call the upstream alert history API (same as /api/alerts/:fp/history).
+ * 4) Merge all history points, sort by time descending (lastReceived, else lastRefreshTime) — latest first.
+ */
+app.get(
+  '/api/alerts/overview-timeline',
+  asyncRoute('/api/alerts/overview-timeline', async (req, res) => {
+    const tenantCode = (req.query.tenantCode || '').trim();
+    const facilityCode = (req.query.facilityCode || '').trim();
+    const signalId = (req.query.signalId || '').trim();
+    if (!tenantCode || !facilityCode || !signalId) {
+      const err = new Error('tenantCode, facilityCode, and signalId query params are required');
+      err.statusCode = 400;
+      throw err;
+    }
+    const stages = [
+      { $match: { tenantCode, facilityCode, signalId } },
+      ...activeSubscriptionFilter(),
+      { $sort: { updatedAt: -1 } },
+      { $limit: 200 },
+    ];
+    const raw = await db.collection('alert_overview').aggregate(stages).toArray();
+
+    const fpSet = new Set();
+    for (const row of raw) {
+      if (row.fingerprint != null && String(row.fingerprint).trim() !== '') {
+        fpSet.add(String(row.fingerprint).trim());
+      }
+    }
+    const fingerprints = [...fpSet];
+    const MAX_FP = 100;
+    const list = fingerprints.slice(0, MAX_FP);
+
+    if (list.length === 0) {
+      res.json({ data: [], errors: {}, overviewRowCount: raw.length, fingerprintCount: 0 });
+      return;
+    }
+
+    const results = await pMapWithLimit(list, 15, fetchUpstreamHistory);
+
+    const merged = [];
+    const errors = {};
+    list.forEach((fp, i) => {
+      const r = results[i];
+      if (!r?.ok) {
+        errors[fp] = r?.error || 'unknown error';
+        return;
+      }
+      const arr = upstreamHistoryToArray(r.value);
+      for (const entry of arr) {
+        merged.push({ ...entry, fingerprint: fp });
+      }
+    });
+
+    const historyTime = (e) => new Date(e.lastReceived || e.lastRefreshTime || 0).getTime();
+    merged.sort((a, b) => {
+      const d = historyTime(b) - historyTime(a);
+      if (d !== 0) return d;
+      return String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''));
+    });
+
+    const MAX_EVENTS = 800;
+    const data = merged.length > MAX_EVENTS ? merged.slice(0, MAX_EVENTS) : merged;
+
+    res.json({
+      data,
+      errors,
+      overviewRowCount: raw.length,
+      fingerprintCount: list.length,
+    });
+  })
+);
+
 /** Fetch a single fingerprint's history from the upstream API. */
 async function fetchUpstreamHistory(fingerprint) {
   const url = `${ALERT_API_BASE}/alerts/${fingerprint}/history`;
