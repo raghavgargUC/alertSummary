@@ -429,10 +429,14 @@ app.post('/api/alerts/histories', asyncRoute('/api/alerts/histories', async (req
 /**
  * GET /api/impact/overview
  * Headline KPIs for the Impact landing page.
+ * Coverage totals (totalSubscriptions, totalCustomers, totalSites) count only
+ * `signal_subscription_config` rows with isSubscribed:true.
  */
 app.get('/api/impact/overview', asyncRoute('/api/impact/overview', async (_req, res) => {
   const overview = db.collection('alert_overview');
   const subs = db.collection('signal_subscription_config');
+  /** Coverage / denominators: only subscribed rows (same scope as activeSubscriptionFilter). */
+  const SUBSCRIBED = { isSubscribed: true };
 
   const [activeFacet, totalCustomersArr, totalSitesArr, totalSignals, totalSubscriptions] = await Promise.all([
     overview.aggregate([
@@ -452,13 +456,14 @@ app.get('/api/impact/overview', asyncRoute('/api/impact/overview', async (_req, 
           ],
       } },
     ]).toArray(),
-    subs.distinct('tenantCode'),
+    subs.distinct('tenantCode', SUBSCRIBED),
     subs.aggregate([
+      { $match: SUBSCRIBED },
       { $group: { _id: { t: '$tenantCode', f: '$facilityCode' } } },
       { $count: 'n' },
     ]).toArray(),
     db.collection('signals_master').countDocuments({ isActive: true }),
-    subs.countDocuments({}),
+    subs.countDocuments(SUBSCRIBED),
   ]);
 
   const agg = activeFacet[0]?.agg?.[0] ?? { instances: 0, customers: [], sites: [], signals: [] };
