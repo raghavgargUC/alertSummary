@@ -36,9 +36,30 @@
 <div id="root"></div>
 
 <script type="text/babel">
-const { useState, useEffect, useCallback, useMemo } = React;
+/*
+ * Alert / Signal Impact Dashboard — single-file React app (Babel-standalone).
+ *
+ * Layout (search the banners below):
+ *   1.  Constants & formatting helpers
+ *   2.  Sortable / filterable table primitives  (useSortFilter, SortHeader, TableFilter)
+ *   3.  URL routing                              (parseHash, buildHash)
+ *   4.  Tiny UI atoms                            (Spinner, ErrorBox, SeverityPill, …)
+ *   5.  Issues tab                               (SignalCard / List / Detail / Situation)
+ *   6.  Impact dashboard                         (ImpactDashboard, KpiTile, top tables)
+ *   7.  Customers tab                            (CustomersScreen, drilldown, panel)
+ *   8.  Subscriptions tab                        (overview, list, matrix)
+ *   9.  App root + tab router
+ *
+ * Why one file: this is dev tooling. Babel-standalone compiles JSX inline; no
+ * bundler. Splitting would mean adopting a build step, which isn't worth it
+ * for an internal dashboard. Section banners below act as our "modules".
+ */
 
-// ── helpers ────────────────────────────────────────────────────────────────
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. Constants & formatting helpers
+// ═════════════════════════════════════════════════════════════════════════════
 
 const SEV_META = {
   CRITICAL: { label: 'Critical', color: '#dc2626', bg: '#fef2f2', border: '#fecaca', tone: 'text-red-600' },
@@ -58,14 +79,192 @@ function fmtTime(iso) {
   return d.toLocaleString('en-IN', { dateStyle: 'short', timeStyle: 'short' });
 }
 
+/**
+ * Bucket a Date / ISO string into the start of its local-timezone day or hour.
+ * Returns epoch ms, suitable as a sortable map key. Use `fmtBucketLabel` for
+ * the human-readable axis tick.
+ */
+function localBucketStart(iso, granularity) {
+  if (!iso) return null;
+  const d = iso instanceof Date ? iso : new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return granularity === 'hour'
+    ? new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()).getTime()
+    : new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+/** Compact local-tz axis label for a bucket epoch ("30 Apr" / "30 Apr 14"). */
+function fmtBucketLabel(epoch, granularity) {
+  const d = new Date(epoch);
+  return granularity === 'hour'
+    ? d.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', hour12: false })
+    : d.toLocaleDateString(undefined, { month: 'short', day: '2-digit' });
+}
+
+/** Full local-tz tooltip label for a bucket epoch. */
+function fmtBucketTooltip(epoch, granularity) {
+  const d = new Date(epoch);
+  return granularity === 'hour'
+    ? d.toLocaleString(undefined, { weekday: 'short', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
+    : d.toLocaleDateString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: '2-digit' });
+}
+
+function fmtRelTime(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return '—';
+  const diff = Date.now() - t;
+  if (diff < 0) return 'just now';
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const dys = Math.floor(h / 24);
+  if (dys < 30) return `${dys}d ago`;
+  return new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+}
+
+function RelTime({ iso }) {
+  if (!iso) return <span className="text-gray-300">—</span>;
+  return (
+    <span className="text-xs text-gray-500" title={fmtTime(iso)}>{fmtRelTime(iso)}</span>
+  );
+}
+
 async function apiFetch(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
 
-// ── Alert-situation helpers ────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. URL routing (hash-based)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Hash scheme:
+//   #/impact
+//   #/customers              · #/customers/:tenantCode
+//   #/issues                 · #/issues/:signalId
+//   #/subscriptions          · #/subscriptions/list   · #/subscriptions/matrix
+//
+// Hash-based (rather than History API) so this works as a static asset under
+// any path without server cooperation. App reads on mount, writes on state
+// change, and listens to `hashchange` + `popstate` for back/forward.
 
+const VALID_TABS = ['impact', 'customers', 'issues', 'subscriptions'];
+const VALID_SUB_VIEWS = ['overview', 'list', 'matrix'];
+
+/** Parse the current location.hash into `{ tab, detail }`. Falls back to `impact`. */
+function parseHash() {
+  const h = (window.location.hash || '').replace(/^#\/?/, '');
+  const [rawTab, rawDetail] = h.split('/').filter(Boolean).map(decodeURIComponent);
+  const tab = VALID_TABS.includes(rawTab) ? rawTab : 'impact';
+  return { tab, detail: rawDetail || null };
+}
+
+/** Build a URL hash for a given tab + optional drilldown / sub-view. */
+function buildHash(tab, detail) {
+  return detail ? `#/${tab}/${encodeURIComponent(detail)}` : `#/${tab}`;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. Sortable / filterable table primitives
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Every data table on the dashboard uses these three pieces. Pull `sf` out of
+// `useSortFilter`, render `<TableFilter {...sf} />` above the table for the
+// search input, and put `<SortHeader k="…" {...sf} />` cells in the <thead>.
+// Each table renders `sf.rows` instead of the raw list.
+
+/**
+ * Stateful sort + text-filter for any homogeneous list.
+ *
+ * @param {Array} rows
+ * @param {Object} opts
+ * @param {string} [opts.defaultKey]  Column to sort by initially.
+ * @param {'asc'|'desc'} [opts.defaultDir='desc']
+ * @param {(row: any, needle: string) => boolean} [opts.filterFn]
+ *        Receives the lowercased query string. Omit to disable text filtering.
+ * @returns { rows, q, setQ, sortKey, sortDir, onSort }
+ */
+function useSortFilter(rows, opts = {}) {
+  const { defaultKey = null, defaultDir = 'desc', filterFn = null } = opts;
+  const [sortKey, setSortKey] = useState(defaultKey);
+  const [sortDir, setSortDir] = useState(defaultDir);
+  const [q, setQ] = useState('');
+
+  const onSort = useCallback((key) => {
+    setSortKey((prev) => {
+      if (prev === key) {
+        setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+        return prev;
+      }
+      setSortDir('desc');
+      return key;
+    });
+  }, []);
+
+  const filtered = useMemo(() => {
+    let list = rows || [];
+    if (q.trim() && filterFn) {
+      const needle = q.trim().toLowerCase();
+      list = list.filter((r) => filterFn(r, needle));
+    }
+    if (sortKey) {
+      list = [...list].sort((a, b) => {
+        const av = a?.[sortKey];
+        const bv = b?.[sortKey];
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        const cmp = (typeof av === 'string' || typeof bv === 'string')
+          ? String(av).localeCompare(String(bv))
+          : (av - bv);
+        return sortDir === 'asc' ? cmp : -cmp;
+      });
+    }
+    return list;
+  }, [rows, q, sortKey, sortDir, filterFn]);
+
+  return { rows: filtered, q, setQ, sortKey, sortDir, onSort };
+}
+
+function SortHeader({ label, k, sortKey, sortDir, onSort, align = 'left', className = '' }) {
+  const active = sortKey === k;
+  const alignCls = align === 'right' ? 'text-right' : align === 'center' ? 'text-center' : 'text-left';
+  return (
+    <th
+      onClick={() => onSort(k)}
+      className={`px-3 py-2 text-[11px] uppercase tracking-wide font-semibold cursor-pointer select-none hover:bg-gray-100 ${alignCls} ${active ? 'text-gray-900' : 'text-gray-500'} ${className}`}
+    >
+      <span className={`inline-flex items-center gap-1 ${align === 'right' ? 'justify-end w-full' : ''}`}>
+        {label}
+        <span className="text-[9px] text-gray-400 w-2 inline-block">{active ? (sortDir === 'asc' ? '▲' : '▼') : ''}</span>
+      </span>
+    </th>
+  );
+}
+
+function TableFilter({ value, onChange, placeholder = 'Filter…', count, total }) {
+  return (
+    <div className="flex items-center gap-3 px-4 py-2 border-b border-gray-100 bg-gray-50/50">
+      <input
+        type="text" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+        className="flex-1 max-w-xs rounded border border-gray-200 px-2.5 py-1 text-xs focus:outline-none focus:border-blue-500 bg-white"
+      />
+      {value && (
+        <button onClick={() => onChange('')} className="text-xs text-gray-500 hover:text-gray-800">Clear</button>
+      )}
+      <span className="ml-auto text-xs text-gray-400 tabular-nums">
+        {count != null && total != null && count !== total ? `${count} of ${total}` : (total != null ? `${total}` : '')}
+      </span>
+    </div>
+  );
+}
+
+// Color palette for charts. 15 distinct hues — chart components cycle through.
 const PALETTE = [
   '#3b82f6','#ef4444','#10b981','#f59e0b','#8b5cf6',
   '#ec4899','#06b6d4','#84cc16','#f97316','#6366f1',
@@ -80,39 +279,52 @@ function fmtDuration(ms) {
   return `${m}m`;
 }
 
+/**
+ * Stitch a chronological history list into discrete alarm events.
+ *
+ * Transitions:
+ *   LOW → CRITICAL/WARNING : event starts
+ *   CRITICAL/WARNING → LOW : event ends
+ *   first non-LOW point    : treated as a start
+ *   CRIT ↔ WARN            : ignored (still bad)
+ *
+ * Events with no `endTime` are still ongoing.
+ */
 function deriveAlertEvents(fingerprint, tenantCode, facilityCode, history) {
   if (!history || history.length === 0) return [];
-  const sorted = [...history].sort((a, b) =>
-    new Date(a.lastReceived || 0) - new Date(b.lastReceived || 0)
+
+  const isBad = (s) => s === 'CRITICAL' || s === 'WARNING';
+  const sorted = [...history].sort(
+    (a, b) => new Date(a.lastReceived || 0) - new Date(b.lastReceived || 0)
   );
+
   const events = [];
   let prevSev = null;
-  let currentEvent = null;
+  let current = null;
+
   for (const entry of sorted) {
     const sev = (entry.severity || '').toUpperCase();
     const time = entry.lastReceived;
-    if (prevSev === null) {
-      // First entry — if non-LOW treat as alert start
-      if (sev === 'CRITICAL' || sev === 'WARNING') {
-        currentEvent = { fingerprint, tenantCode, facilityCode, severity: sev, startTime: time, endTime: null };
-      }
-    } else if (prevSev === 'LOW' && (sev === 'CRITICAL' || sev === 'WARNING')) {
-      currentEvent = { fingerprint, tenantCode, facilityCode, severity: sev, startTime: time, endTime: null };
-    } else if ((prevSev === 'CRITICAL' || prevSev === 'WARNING') && sev === 'LOW') {
-      if (currentEvent) {
-        currentEvent.endTime = time;
-        events.push({ ...currentEvent });
-        currentEvent = null;
-      }
+
+    const opensEvent = (prevSev === null && isBad(sev)) || (prevSev === 'LOW' && isBad(sev));
+    const closesEvent = isBad(prevSev) && sev === 'LOW';
+
+    if (opensEvent) {
+      current = { fingerprint, tenantCode, facilityCode, severity: sev, startTime: time, endTime: null };
+    } else if (closesEvent && current) {
+      current.endTime = time;
+      events.push(current);
+      current = null;
     }
-    // CRITICAL→CRITICAL, CRITICAL→WARNING, WARNING→CRITICAL, LOW→LOW = no new event
     prevSev = sev;
   }
-  if (currentEvent) events.push({ ...currentEvent, ongoing: true });
+  if (current) events.push({ ...current, ongoing: true });
   return events;
 }
 
-// ── tiny components ────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. Tiny UI atoms
+// ═════════════════════════════════════════════════════════════════════════════
 
 function Spinner() {
   return (
@@ -160,7 +372,9 @@ function BackButton({ onClick, label }) {
   );
 }
 
-// ── SignalList screen ──────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. Issues tab — Signal list, severity drilldown, history, Alert Situation
+// ═════════════════════════════════════════════════════════════════════════════
 
 function SignalCard({ signal, onClick }) {
   const { severityCounts, total } = signal;
@@ -476,7 +690,7 @@ function HistoryPanel({ alert, onClose }) {
 // ── ChartCanvas ────────────────────────────────────────────────────────────
 
 function ChartCanvas({ type, labels, datasets, chartOptions, height }) {
-  const canvasRef = React.useRef(null);
+  const canvasRef = useRef(null);
   useEffect(() => {
     if (!canvasRef.current) return;
     const chart = new Chart(canvasRef.current, {
@@ -497,7 +711,7 @@ function ChartCanvas({ type, labels, datasets, chartOptions, height }) {
 // ── TenantAlertsBreakdown ──────────────────────────────────────────────────
 
 function TenantAlertsBreakdown({ dates, tenants, byDateTenant }) {
-  const [selectedTenant, setSelectedTenant] = React.useState(null);
+  const [selectedTenant, setSelectedTenant] = useState(null);
 
   // Compute total alerts per tenant, sorted descending
   const tenantTotals = tenants
@@ -841,6 +1055,71 @@ function isFingerprintSubscribed(alert, subscribedFp) {
   return subscribedFp.has(String(alert.fingerprint).trim());
 }
 
+/**
+ * Show the cube / alert-condition payload for a single alert_overview row.
+ * Two views: a quick "headline + metric chips + key fields" summary, and the
+ * raw template JSON for debugging.
+ */
+function AlertConditionPayload({ alert }) {
+  const tpl     = alert?.template ?? {};
+  const metrics = Array.isArray(tpl.metric) ? tpl.metric : [];
+
+  return (
+    <div className="space-y-3">
+      {/* Headline + description */}
+      {(tpl.heading || tpl.description) && (
+        <div>
+          {tpl.heading && <p className="text-sm font-semibold text-gray-900">{tpl.heading}</p>}
+          {tpl.description && <p className="text-xs text-gray-600 mt-0.5">{tpl.description}</p>}
+        </div>
+      )}
+
+      {/* Metric chips (the actual cube values driving the alert) */}
+      {metrics.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {metrics.map((m, idx) => (
+            <div key={idx} className="rounded border border-gray-200 bg-white px-2.5 py-1.5 text-xs flex flex-col items-center min-w-[80px]">
+              <span className="text-gray-500 font-medium">{m.heading || '—'}</span>
+              <span className="text-lg font-bold text-gray-900 leading-tight">{m.count != null ? Number(m.count).toLocaleString() : '—'}</span>
+              {m.subheading && <span className="text-gray-500">{m.subheading}</span>}
+              {m.timestamp && <span className="text-gray-400 mt-0.5 text-center leading-tight">{m.timestamp}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Selected scalar fields (skip the ones already shown above) */}
+      {(() => {
+        const SHOWN = new Set(['heading', 'description', 'metric']);
+        const extras = Object.entries(tpl).filter(([k, v]) =>
+          !SHOWN.has(k) && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+        );
+        if (extras.length === 0) return null;
+        return (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1 text-xs">
+            {extras.map(([k, v]) => (
+              <div key={k} className="flex gap-2">
+                <span className="text-gray-500">{k}</span>
+                <span className="text-gray-800 font-mono truncate" title={String(v)}>{String(v)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })()}
+
+      {/* Raw template JSON — collapsed by default */}
+      <details className="text-xs">
+        <summary className="cursor-pointer text-gray-500 hover:text-gray-800 select-none font-medium">
+          Raw template JSON
+        </summary>
+        <pre className="mt-2 p-2 bg-gray-900 text-gray-100 rounded overflow-x-auto leading-snug" style={{ fontSize: '11px' }}>
+          {JSON.stringify(tpl, null, 2)}
+        </pre>
+      </details>
+    </div>
+  );
+}
+
 function SituationFingerprintTables({ activeAlerts, allEvents, subscribedFp }) {
   const liveRows = [...(activeAlerts || [])].sort((a, b) =>
     String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''))
@@ -853,37 +1132,65 @@ function SituationFingerprintTables({ activeAlerts, allEvents, subscribedFp }) {
           String(a.fingerprint || '').localeCompare(String(b.fingerprint || ''))
         );
 
+  // Track which live row is expanded to show its alert-condition JSON.
+  const [expandedKey, setExpandedKey] = useState(null);
+  const rowKey = (a, i) => a._id || `${i}-${a.fingerprint}`;
+
   const th = 'px-3 py-2 text-left text-[11px] font-bold text-gray-600 uppercase tracking-wide border-b border-gray-200 bg-gray-50';
   const td = 'px-3 py-2 align-top border-t border-gray-100 text-xs';
 
   return (
     <div className="space-y-4">
       <div className="rounded-xl border border-red-200 bg-white shadow-sm overflow-hidden">
-        <div className="px-4 py-2.5 bg-red-50 border-b border-red-100">
+        <div className="px-4 py-2.5 bg-red-50 border-b border-red-100 flex items-baseline justify-between">
           <h4 className="text-sm font-bold text-red-900">Live CRITICAL / WARNING (overview)</h4>
+          <span className="text-[11px] text-red-700/70">Click a row to inspect its alert-condition payload</span>
         </div>
-        <div className="overflow-x-auto max-h-72 overflow-y-auto">
+        <div className="overflow-x-auto max-h-96 overflow-y-auto">
           {liveRows.length === 0 ? (
             <p className="px-4 py-6 text-sm text-gray-400 text-center">No CRITICAL/WARNING rows in this snapshot.</p>
           ) : (
             <table className="min-w-full">
-              <thead>
+              <thead className="sticky top-0">
                 <tr>
+                  <th className={`${th} w-6`}></th>
                   <th className={th}>Fingerprint</th>
                   <th className={th}>Tenant</th>
                   <th className={th}>Facility</th>
                   <th className={th}>Severity</th>
+                  <th className={th}>Headline</th>
                 </tr>
               </thead>
               <tbody>
-                {liveRows.map((a, i) => (
-                  <tr key={a._id || `live-${i}-${a.fingerprint}`} className="hover:bg-red-50/40">
-                    <td className={`${td} font-mono text-[11px] text-gray-900 max-w-xs break-all`}>{a.fingerprint || '—'}</td>
-                    <td className={`${td} text-gray-800`}>{a.tenantCode || '—'}</td>
-                    <td className={`${td} font-mono text-gray-600`}>{a.facilityCode || '—'}</td>
-                    <td className={td}><SeverityPill sev={(a.severity || '').toUpperCase()} /></td>
-                  </tr>
-                ))}
+                {liveRows.map((a, i) => {
+                  const k = rowKey(a, i);
+                  const isOpen = expandedKey === k;
+                  return (
+                    <React.Fragment key={k}>
+                      <tr onClick={() => setExpandedKey(isOpen ? null : k)}
+                          className="hover:bg-red-50/60 cursor-pointer">
+                        <td className={`${td} text-gray-400`}>
+                          <span style={{ display: 'inline-block', transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▸</span>
+                        </td>
+                        <td className={`${td} font-mono text-[11px] text-gray-900 max-w-xs break-all`}>{a.fingerprint || '—'}</td>
+                        <td className={`${td} text-gray-800`}>{a.tenantCode || '—'}</td>
+                        <td className={`${td} font-mono text-gray-600`}>{a.facilityCode || '—'}</td>
+                        <td className={td}><SeverityPill sev={(a.severity || '').toUpperCase()} /></td>
+                        <td className={`${td} text-gray-700 truncate max-w-md`} title={a.template?.heading || ''}>
+                          {a.template?.heading || <span className="text-gray-300">—</span>}
+                        </td>
+                      </tr>
+                      {isOpen && (
+                        <tr key={`${k}-payload`} className="bg-slate-50/80">
+                          <td></td>
+                          <td colSpan="5" className="px-3 py-3 border-t border-gray-100">
+                            <AlertConditionPayload alert={a} />
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -1001,43 +1308,50 @@ function AlertingSituationView({ signalId, alerts }) {
     setError(null);
     setAllEvents([]);
     setProgress(0);
-    if (!activeAlerts || activeAlerts.length === 0) {
-      setLoading(false);
-      return () => { cancelled = true; };
-    }
-    const list = activeAlerts.filter((a) => a.fingerprint);
+
+    const list = (activeAlerts || []).filter((a) => a.fingerprint);
     if (list.length === 0) {
       setLoading(false);
       return () => { cancelled = true; };
     }
-    const total = list.length;
-    let done = 0;
-    Promise.all(
-      list.map(async (alert) => {
-        try {
-          const data = await apiFetch(`/api/alerts/${alert.fingerprint}/history`);
-          const history = data.data || data || [];
-          const events = deriveAlertEvents(alert.fingerprint, alert.tenantCode, alert.facilityCode, history);
-          done++;
-          if (!cancelled) setProgress(Math.round((done / total) * 100));
-          return events;
-        } catch {
-          done++;
-          if (!cancelled) setProgress(Math.round((done / total) * 100));
-          return [];
-        }
+
+    // One batched POST instead of N parallel GETs. The browser caps concurrent
+    // connections to a single origin (~6 for HTTP/1.1) — server-side fan-out
+    // hits the upstream API with a higher concurrency cap and returns one
+    // combined payload. Typically 3–5× faster than the per-fingerprint loop.
+    const fingerprints = list.map((a) => a.fingerprint);
+    setProgress(0);
+    fetch('/api/alerts/histories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints }),
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        return res.json();
       })
-    ).then((results) => {
-      if (!cancelled) {
-        setAllEvents(results.flat());
+      .then(({ histories = {}, errors = {} }) => {
+        if (cancelled) return;
+        const events = [];
+        for (const a of list) {
+          const h = histories[a.fingerprint];
+          if (!h) continue; // missing or upstream-failed; skip
+          const arr = Array.isArray(h) ? h : (h.data || []);
+          events.push(...deriveAlertEvents(a.fingerprint, a.tenantCode, a.facilityCode, arr));
+        }
+        const failedCount = Object.keys(errors).length;
+        if (failedCount > 0) console.warn(`[history] ${failedCount} fingerprint(s) failed upstream`, errors);
+        setAllEvents(events);
+        setProgress(100);
         setLoading(false);
-      }
-    }).catch((e) => {
-      if (!cancelled) {
-        setError(e.message);
-        setLoading(false);
-      }
-    });
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setError(e.message);
+          setLoading(false);
+        }
+      });
+
     return () => { cancelled = true; };
   }, [activeAlerts]);
 
@@ -1061,9 +1375,49 @@ function AlertingSituationView({ signalId, alerts }) {
   const dates = Object.keys(byDateTenant).sort();
 
   const resolved = allEvents.filter((e) => e.endTime);
-  const avgResolutionMs = resolved.length > 0
-    ? resolved.reduce((s, e) => s + (new Date(e.endTime) - new Date(e.startTime)), 0) / resolved.length
+  const ongoing = allEvents.filter((e) => !e.endTime);
+  const now = Date.now();
+
+  const resolvedDurations = resolved.map((e) => new Date(e.endTime) - new Date(e.startTime));
+  const ongoingDurations = ongoing.map((e) => now - new Date(e.startTime).getTime());
+
+  const avgResolutionMs = resolvedDurations.length > 0
+    ? resolvedDurations.reduce((s, n) => s + n, 0) / resolvedDurations.length
     : null;
+  const medianResolutionMs = (() => {
+    if (resolvedDurations.length === 0) return null;
+    const sorted = [...resolvedDurations].sort((a, b) => a - b);
+    const m = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[m] : Math.round((sorted[m - 1] + sorted[m]) / 2);
+  })();
+  const longestOngoingMs = ongoingDurations.length > 0 ? Math.max(...ongoingDurations) : null;
+  const totalImpactMs = ongoingDurations.reduce((s, n) => s + n, 0)
+    + resolvedDurations.reduce((s, n) => s + n, 0);
+
+  const customersInEvents = new Set(allEvents.map((e) => e.tenantCode).filter(Boolean));
+  const sitesInEvents = new Set(allEvents.map((e) => `${e.tenantCode}|${e.facilityCode}`));
+
+  // Aging buckets for currently-ongoing alarms
+  const ageBuckets = [
+    { label: '<1h', max: 3600_000, count: 0, color: '#16a34a' },
+    { label: '1–6h', max: 6 * 3600_000, count: 0, color: '#facc15' },
+    { label: '6–24h', max: 24 * 3600_000, count: 0, color: '#f97316' },
+    { label: '>24h', max: Infinity, count: 0, color: '#dc2626' },
+  ];
+  for (const ms of ongoingDurations) {
+    for (const b of ageBuckets) { if (ms < b.max) { b.count += 1; break; } }
+  }
+
+  // Resolution speed buckets (cleared)
+  const resBuckets = [
+    { label: 'within 1h', max: 3600_000, count: 0 },
+    { label: 'within 6h', max: 6 * 3600_000, count: 0 },
+    { label: 'within 24h', max: 24 * 3600_000, count: 0 },
+    { label: '>24h', max: Infinity, count: 0 },
+  ];
+  for (const ms of resolvedDurations) {
+    for (const b of resBuckets) { if (ms < b.max) { b.count += 1; break; } }
+  }
 
   let critLive = 0;
   let warnLive = 0;
@@ -1074,18 +1428,158 @@ function AlertingSituationView({ signalId, alerts }) {
   }
   const liveBreaching = critLive + warnLive;
 
-  const chart3Labels = dates;
-  const chart3Datasets = [{
-    label: 'New escalations per day',
-    data: dates.map((d) => Object.values(byDateTenant[d] || {}).reduce((s, v) => s + v, 0)),
-    fill: true,
-    backgroundColor: 'rgba(59,130,246,0.12)',
-    borderColor: '#3b82f6',
-    borderWidth: 2,
-    tension: 0.35,
-    pointRadius: 4,
-    pointBackgroundColor: '#3b82f6',
-  }];
+  const fmtCustomerHours = (ms) => {
+    if (ms == null || ms <= 0) return '0h';
+    const h = ms / 3600_000;
+    if (h >= 100) return `${Math.round(h).toLocaleString('en-IN')}h`;
+    if (h >= 10) return `${h.toFixed(0)}h`;
+    return `${h.toFixed(1)}h`;
+  };
+
+  const [chartGran, setChartGran] = useState('day'); // 'day' | 'hour'
+  const [chartCut, setChartCut] = useState('total'); // 'total' | 'severity' | 'tenant' | 'lifecycle'
+
+  const escChart = useMemo(() => {
+    // Buckets keyed by epoch-ms at the start of the LOCAL day/hour, so the
+    // x-axis aligns to the user's clock rather than UTC.
+    const allKeys = new Set();
+    const buckets = {}; // epochMs -> { series: count }
+    const addPoint = (iso, series) => {
+      const k = localBucketStart(iso, chartGran);
+      if (k == null) return;
+      allKeys.add(k);
+      if (!buckets[k]) buckets[k] = {};
+      buckets[k][series] = (buckets[k][series] || 0) + 1;
+    };
+
+    if (chartCut === 'total') {
+      for (const e of allEvents) addPoint(e.startTime, 'Escalations');
+    } else if (chartCut === 'severity') {
+      for (const e of allEvents) addPoint(e.startTime, (e.severity || 'OTHER'));
+    } else if (chartCut === 'tenant') {
+      const tot = {};
+      for (const e of allEvents) tot[e.tenantCode || '—'] = (tot[e.tenantCode || '—'] || 0) + 1;
+      const top = Object.entries(tot).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([t]) => t);
+      const topSet = new Set(top);
+      for (const e of allEvents) {
+        const k = topSet.has(e.tenantCode) ? e.tenantCode : 'Other';
+        addPoint(e.startTime, k);
+      }
+    } else if (chartCut === 'lifecycle') {
+      for (const e of allEvents) addPoint(e.startTime, 'Escalated');
+      for (const e of allEvents) if (e.endTime) addPoint(e.endTime, 'Resolved');
+    }
+
+    const keys = [...allKeys].sort((a, b) => a - b);
+    const seriesSet = new Set();
+    for (const k of keys) for (const s of Object.keys(buckets[k] || {})) seriesSet.add(s);
+    let series = [...seriesSet];
+    // Stable order for known series
+    if (chartCut === 'severity') {
+      const order = ['CRITICAL', 'WARNING', 'LOW', 'OTHER'];
+      series.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+    } else if (chartCut === 'lifecycle') {
+      series = ['Escalated', 'Resolved'].filter((s) => seriesSet.has(s));
+    } else if (chartCut === 'tenant') {
+      series.sort((a, b) => {
+        if (a === 'Other') return 1;
+        if (b === 'Other') return -1;
+        return 0;
+      });
+    }
+
+    const colorFor = (name, idx) => {
+      if (chartCut === 'severity') {
+        if (name === 'CRITICAL') return '#dc2626';
+        if (name === 'WARNING') return '#f59e0b';
+        if (name === 'LOW') return '#2563eb';
+        return '#9ca3af';
+      }
+      if (chartCut === 'lifecycle') {
+        if (name === 'Escalated') return '#dc2626';
+        if (name === 'Resolved') return '#16a34a';
+      }
+      if (chartCut === 'total') return '#3b82f6';
+      return PALETTE[idx % PALETTE.length];
+    };
+
+    const stacked = chartCut === 'tenant';
+    const chartType = stacked ? 'bar' : 'line';
+
+    const datasets = series.map((s, idx) => {
+      const c = colorFor(s, idx);
+      const base = { label: s, data: keys.map((k) => buckets[k]?.[s] || 0) };
+      if (stacked) {
+        return { ...base, backgroundColor: c, borderColor: c, borderWidth: 1, stack: 'tenants', borderRadius: 2 };
+      }
+      return {
+        ...base,
+        borderColor: c,
+        backgroundColor: chartCut === 'total' ? 'rgba(59,130,246,0.12)' : c + '22',
+        borderWidth: 2,
+        tension: 0.3,
+        pointRadius: 3,
+        pointBackgroundColor: c,
+        fill: chartCut === 'total',
+      };
+    });
+
+    // Manual tick stride keeps the x-axis readable across windows of any size.
+    const tickStride = Math.max(1, Math.ceil(keys.length / (chartGran === 'hour' ? 14 : 12)));
+
+    return {
+      type: chartType,
+      labels: keys.map((k) => fmtBucketLabel(k, chartGran)),
+      // Keep the raw epoch keys around so the tooltip can show full local time.
+      _bucketEpochs: keys,
+      datasets,
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: stacked ? 'index' : 'nearest', intersect: !stacked },
+        plugins: {
+          legend: {
+            position: 'top', display: chartCut !== 'total',
+            labels: { boxWidth: 12, padding: 14, font: { size: 11 }, usePointStyle: !stacked },
+          },
+          tooltip: {
+            backgroundColor: 'rgba(15,23,42,0.92)',
+            padding: 10, cornerRadius: 6,
+            titleFont: { size: 12, weight: 'bold' }, bodyFont: { size: 12 },
+            callbacks: {
+              title: (items) => fmtBucketTooltip(keys[items[0].dataIndex], chartGran),
+              label: (ctx) => {
+                const v = ctx.parsed.y;
+                return ` ${ctx.dataset.label}: ${v.toLocaleString()} event${v === 1 ? '' : 's'}`;
+              },
+              footer: stacked ? (items) => {
+                const total = items.reduce((s, i) => s + (i.parsed.y || 0), 0);
+                return `Total: ${total.toLocaleString()}`;
+              } : undefined,
+            },
+          },
+        },
+        scales: {
+          x: {
+            stacked, grid: { display: false },
+            ticks: {
+              color: '#6b7280', font: { size: 11 },
+              autoSkip: true, maxRotation: chartGran === 'hour' ? 30 : 0,
+              callback: function (_, idx) {
+                return idx % tickStride === 0 ? this.getLabelForValue(idx) : '';
+              },
+            },
+          },
+          y: {
+            stacked, beginAtZero: true,
+            grid: { color: '#f3f4f6', drawBorder: false },
+            ticks: { color: '#6b7280', font: { size: 11 }, precision: 0, padding: 6, callback: (v) => v.toLocaleString() },
+            title: { display: true, text: 'Events', color: '#6b7280', font: { size: 11, weight: '500' } },
+          },
+        },
+      },
+    };
+  }, [allEvents, chartGran, chartCut]);
 
   if (loading) {
     return (
@@ -1105,26 +1599,123 @@ function AlertingSituationView({ signalId, alerts }) {
 
   return (
     <div className="space-y-5 fade-in">
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        {[
-          {
-            label: 'Total alert',
-            sub: `${activeAlerts.length} live + ${extraLowOverviewRows} LOW (same tenant · facility · signal)`,
-            value: totalAlertCount,
-            color: '#0f172a',
-            bg: 'bg-slate-50',
-            border: 'border-slate-200',
-          },
-          { label: 'Live alert', sub: `${critLive} Critical · ${warnLive} Warning`, value: liveBreaching, color: '#b91c1c', bg: 'bg-red-50/90', border: 'border-red-200' },
-          { label: 'Avg. time to clear', sub: 'For cleared only', value: avgResolutionMs != null ? fmtDuration(avgResolutionMs) : '—', color: '#0e7490', bg: 'bg-cyan-50/90', border: 'border-cyan-200' },
-        ].map((c) => (
-          <div key={c.label} className={`rounded-xl border ${c.border} ${c.bg} px-3 py-3 text-left shadow-sm`}>
-            <p className="text-[10px] sm:text-xs text-gray-500 font-semibold leading-tight">{c.label}</p>
-            <p className="text-xs text-gray-400 mt-0.5 mb-1">{c.sub}</p>
-            <p className="text-2xl sm:text-3xl font-black tabular-nums tracking-tight" style={{ color: c.color }}>{c.value}</p>
-          </div>
-        ))}
+      {/* Scope row — who/how-much is impacted right now */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiTile
+          label="Customers affected"
+          value={customersInEvents.size}
+          sub={`across ${sitesInEvents.size} site${sitesInEvents.size !== 1 ? 's' : ''}`}
+          accent="#b91c1c" tone="bg-red-50/60 border-red-200"
+        />
+        <KpiTile
+          label="Currently ongoing"
+          value={ongoing.length}
+          sub={`${critLive} Critical · ${warnLive} Warning live`}
+          accent="#b91c1c" tone="bg-red-50/60 border-red-200"
+        />
+        <KpiTile
+          label="Customer-hours of impact"
+          value={fmtCustomerHours(totalImpactMs)}
+          sub="Sum of all alarm durations"
+          accent="#0e7490" tone="bg-cyan-50/60 border-cyan-200"
+        />
+        <KpiTile
+          label="Longest open"
+          value={longestOngoingMs != null ? fmtDuration(longestOngoingMs) : '—'}
+          sub={longestOngoingMs != null ? 'Of currently-ongoing alarms' : 'No ongoing alarms'}
+          accent="#b45309" tone="bg-amber-50/60 border-amber-200"
+        />
       </div>
+
+      {/* Lifecycle row — events & resolution performance */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiTile
+          label="Total alarm events"
+          value={allEvents.length}
+          sub={`${resolved.length} cleared · ${ongoing.length} ongoing`}
+          accent="#0f172a"
+        />
+        <KpiTile
+          label="Total alert (snapshot)"
+          value={totalAlertCount}
+          sub={`${activeAlerts.length} live + ${extraLowOverviewRows} LOW (same tenant · facility · signal)`}
+          accent="#0f172a"
+        />
+        <KpiTile
+          label="Median time to clear"
+          value={medianResolutionMs != null ? fmtDuration(medianResolutionMs) : '—'}
+          sub={`avg ${avgResolutionMs != null ? fmtDuration(avgResolutionMs) : '—'}`}
+          accent="#0f172a"
+        />
+        <KpiTile
+          label="Cleared within 1h"
+          value={resolved.length > 0 ? `${Math.round((resBuckets[0].count / resolved.length) * 100)}%` : '—'}
+          sub={resolved.length > 0 ? `${resBuckets[0].count} of ${resolved.length} cleared` : 'No cleared events'}
+          accent="#16a34a" tone="bg-green-50/60 border-green-200"
+        />
+      </div>
+
+      {/* Aging buckets — where ongoing alarms sit */}
+      {ongoing.length > 0 && (
+        <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-100 flex items-baseline justify-between">
+            <h4 className="text-sm font-bold text-gray-800">Aging of ongoing alarms</h4>
+            <span className="text-xs text-gray-500">{ongoing.length} ongoing</span>
+          </div>
+          <div className="px-4 py-4">
+            <div className="flex h-7 rounded-md overflow-hidden border border-gray-100">
+              {ageBuckets.map((b) => {
+                const pct = (b.count / ongoing.length) * 100;
+                if (pct === 0) return null;
+                return (
+                  <div key={b.label} title={`${b.label}: ${b.count} alarm${b.count !== 1 ? 's' : ''}`}
+                       style={{ width: `${pct}%`, background: b.color }}
+                       className="flex items-center justify-center text-[11px] font-semibold text-white">
+                    {pct >= 8 ? `${b.count}` : ''}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex flex-wrap gap-x-5 gap-y-1 mt-3 text-xs">
+              {ageBuckets.map((b) => (
+                <span key={b.label} className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-sm" style={{ background: b.color }} />
+                  <span className="text-gray-600 font-medium">{b.label}</span>
+                  <span className="text-gray-400 tabular-nums">{b.count}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Resolution speed — distribution of cleared events */}
+      {resolved.length > 0 && (
+        <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-100 flex items-baseline justify-between">
+            <h4 className="text-sm font-bold text-gray-800">How quickly we clear alarms</h4>
+            <span className="text-xs text-gray-500">{resolved.length} cleared</span>
+          </div>
+          <div className="px-4 py-4 space-y-2">
+            {resBuckets.map((b, idx) => {
+              const pct = (b.count / resolved.length) * 100;
+              const color = ['#16a34a', '#84cc16', '#f59e0b', '#dc2626'][idx];
+              return (
+                <div key={b.label} className="flex items-center gap-3 text-xs">
+                  <span className="w-24 shrink-0 text-gray-700 font-medium">{b.label}</span>
+                  <div className="flex-1 h-5 bg-gray-100 rounded overflow-hidden">
+                    <div className="h-full rounded flex items-center px-2 text-white font-semibold"
+                         style={{ width: `${Math.max(pct, b.count > 0 ? 4 : 0)}%`, background: color }}>
+                      {b.count > 0 && pct >= 6 ? `${b.count}` : ''}
+                    </div>
+                  </div>
+                  <span className="w-12 shrink-0 text-right tabular-nums text-gray-600">{Math.round(pct)}%</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {alerts && alerts.length > 0 && (
         <SituationFingerprintTables
@@ -1142,9 +1733,48 @@ function AlertingSituationView({ signalId, alerts }) {
       ) : (
         <>
           <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
-            <h4 className="text-sm font-bold text-gray-800 mb-1">New escalations per day</h4>
-            <p className="text-xs text-gray-500 mb-3">Aggregated across tenant/facility streams for this signal.</p>
-            <ChartCanvas key={`agg-${chart3Labels.join(',')}`} type="line" labels={chart3Labels} datasets={chart3Datasets} />
+            <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+              <div>
+                <h4 className="text-sm font-bold text-gray-800">Escalations over time</h4>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {chartCut === 'total' && 'Aggregated across tenant/facility streams for this signal.'}
+                  {chartCut === 'severity' && 'Split by severity at the moment of escalation.'}
+                  {chartCut === 'tenant' && 'Stacked by top 5 tenants (rest grouped as "Other").'}
+                  {chartCut === 'lifecycle' && 'Escalations vs resolutions — when alarms started vs cleared.'}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="inline-flex rounded-md border border-gray-200 bg-gray-50 p-0.5 text-xs font-semibold">
+                  {[{k:'day',l:'Day'},{k:'hour',l:'Hour'}].map((o) => (
+                    <button key={o.k} onClick={() => setChartGran(o.k)}
+                      className={`px-2.5 py-1 rounded ${chartGran === o.k ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-800'}`}>
+                      {o.l}
+                    </button>
+                  ))}
+                </div>
+                <div className="inline-flex rounded-md border border-gray-200 bg-gray-50 p-0.5 text-xs font-semibold">
+                  {[
+                    {k:'total',l:'Total'},
+                    {k:'severity',l:'By severity'},
+                    {k:'tenant',l:'By tenant'},
+                    {k:'lifecycle',l:'Lifecycle'},
+                  ].map((o) => (
+                    <button key={o.k} onClick={() => setChartCut(o.k)}
+                      className={`px-2.5 py-1 rounded ${chartCut === o.k ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-800'}`}>
+                      {o.l}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <ChartCanvas
+              key={`esc-${chartGran}-${chartCut}-${escChart.labels.join(',')}`}
+              type={escChart.type}
+              labels={escChart.labels}
+              datasets={escChart.datasets}
+              chartOptions={escChart.options}
+              height={280}
+            />
           </div>
 
           <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
@@ -1184,13 +1814,14 @@ function AlertingSituationView({ signalId, alerts }) {
 
 // ── SignalDetail screen ────────────────────────────────────────────────────
 
-function SignalDetailScreen({ signal, onBack }) {
+function SignalDetailScreen({ signal, onBack, onSelectCustomer }) {
   const [selectedSev, setSelectedSev] = useState(null);
   const [alerts, setAlerts] = useState([]);
   const [critSummary, setCritSummary] = useState(null);
   const [alertLoading, setAlertLoading] = useState(false);
   const [alertError, setAlertError] = useState(null);
   const [activeAlert, setActiveAlert] = useState(null);
+  const [showAffected, setShowAffected] = useState(true);
 
   // Global situation toggle — covers ALL severities
   const [showSituation, setShowSituation] = useState(false);
@@ -1235,10 +1866,20 @@ function SignalDetailScreen({ signal, onBack }) {
       {/* breadcrumb + global toggle */}
       <div className="mb-6 flex items-start gap-3">
         <div className="flex-1">
-          <BackButton onClick={onBack} label="All Signals" />
+          <BackButton onClick={onBack} label="All Issues" />
           <h2 className="text-xl font-bold text-gray-900 mt-2">{signal.name}</h2>
           {signal.description && <p className="text-sm text-gray-500 mt-1">{signal.description}</p>}
         </div>
+        <button
+          onClick={() => setShowAffected((v) => !v)}
+          className={`mt-1 shrink-0 px-3 py-2 rounded-lg border font-semibold text-sm transition-all ${
+            showAffected
+              ? 'bg-gray-900 text-white border-gray-900'
+              : 'bg-white text-gray-700 border-gray-300 hover:border-gray-500'
+          }`}
+        >
+          Affected customers
+        </button>
         <button
           onClick={toggleSituation}
           className={`mt-1 shrink-0 flex items-center gap-2 px-4 py-2 rounded-lg border font-semibold text-sm transition-all ${
@@ -1253,6 +1894,12 @@ function SignalDetailScreen({ signal, onBack }) {
           Alert Situation
         </button>
       </div>
+
+      {showAffected && !showSituation && onSelectCustomer && (
+        <div className="mb-6">
+          <AffectedCustomersPanel signalId={signal._id} onSelectCustomer={onSelectCustomer} />
+        </div>
+      )}
 
       {/* Global situation view */}
       {showSituation && (
@@ -1347,45 +1994,1099 @@ function SignalDetailScreen({ signal, onBack }) {
   );
 }
 
-// ── App root ───────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. Impact dashboard
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Headline number tile used by Impact + Customer drilldowns. */
+function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200' }) {
+  return (
+    <div className={`rounded-xl border ${tone} px-4 py-3 shadow-sm`}>
+      <p className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold leading-none">{label}</p>
+      <p className="text-3xl font-black tabular-nums tracking-tight mt-2" style={{ color: accent }}>{value}</p>
+      {sub && <p className="text-xs text-gray-400 mt-1 leading-snug">{sub}</p>}
+    </div>
+  );
+}
+
+// ── Impact dashboard tables ────────────────────────────────────────────────
+
+function ImpactCustomersTable({ rows, onSelectCustomer }) {
+  const sf = useSortFilter(rows, {
+    defaultKey: 'critical', defaultDir: 'desc',
+    filterFn: (r, n) => r.tenantCode.toLowerCase().includes(n),
+  });
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+        <h3 className="text-sm font-bold text-gray-800">Most impacted customers</h3>
+        <span className="text-xs text-gray-400">Click a column to sort</span>
+      </div>
+      <TableFilter value={sf.q} onChange={sf.setQ} placeholder="Filter customer…" count={sf.rows.length} total={rows.length} />
+      {rows.length === 0 ? (
+        <p className="px-4 py-6 text-sm text-gray-400 text-center">No active issues right now.</p>
+      ) : (
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <SortHeader label="Customer" k="tenantCode" {...sf} />
+              <SortHeader label="Issues" k="instances" align="right" {...sf} />
+              <SortHeader label="Sites" k="sitesAffected" align="right" {...sf} />
+              <SortHeader label="Critical" k="critical" align="right" {...sf} />
+              <SortHeader label="Last updated" k="lastUpdated" align="right" {...sf} />
+            </tr>
+          </thead>
+          <tbody>
+            {sf.rows.map((c) => (
+              <tr key={c.tenantCode} onClick={() => onSelectCustomer(c.tenantCode)}
+                  className="border-t border-gray-100 hover:bg-blue-50/40 cursor-pointer">
+                <td className="px-4 py-2 font-medium text-gray-800">{c.tenantCode}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-700">{c.instances}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">{c.sitesAffected}</td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {c.critical > 0 ? <span className="font-bold text-red-600">{c.critical}</span> : <span className="text-gray-400">0</span>}
+                </td>
+                <td className="px-3 py-2 text-right"><RelTime iso={c.lastUpdated} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function ImpactIssuesTable({ rows, onSelectIssue }) {
+  const sf = useSortFilter(rows, {
+    defaultKey: 'customersAffected', defaultDir: 'desc',
+    filterFn: (r, n) => (r.name || '').toLowerCase().includes(n) || (r.module || '').toLowerCase().includes(n),
+  });
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+        <h3 className="text-sm font-bold text-gray-800">Most-impacting issues</h3>
+        <span className="text-xs text-gray-400">Click a column to sort</span>
+      </div>
+      <TableFilter value={sf.q} onChange={sf.setQ} placeholder="Filter issue or module…" count={sf.rows.length} total={rows.length} />
+      {rows.length === 0 ? (
+        <p className="px-4 py-6 text-sm text-gray-400 text-center">No issues firing.</p>
+      ) : (
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <SortHeader label="Issue" k="name" {...sf} />
+              <SortHeader label="Customers" k="customersAffected" align="right" {...sf} />
+              <SortHeader label="Sites" k="sitesAffected" align="right" {...sf} />
+              <SortHeader label="Critical" k="critical" align="right" {...sf} />
+              <SortHeader label="Last updated" k="lastUpdated" align="right" {...sf} />
+            </tr>
+          </thead>
+          <tbody>
+            {sf.rows.map((i) => (
+              <tr key={i.signalId} onClick={() => onSelectIssue({
+                    _id: i.signalId, name: i.name, module: i.module,
+                    signalCode: i.signalCode, description: '',
+                    severityCounts: { CRITICAL: i.critical, WARNING: i.warning, LOW: 0 },
+                  })}
+                  className="border-t border-gray-100 hover:bg-blue-50/40 cursor-pointer">
+                <td className="px-4 py-2">
+                  <p className="font-medium text-gray-800 leading-tight">{i.name}</p>
+                  <p className="text-[11px] text-gray-400 mt-0.5 uppercase tracking-wide">{i.module || '—'}</p>
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-700">{i.customersAffected}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">{i.sitesAffected}</td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {i.critical > 0 ? <span className="font-bold text-red-600">{i.critical}</span> : <span className="text-gray-400">0</span>}
+                </td>
+                <td className="px-3 py-2 text-right"><RelTime iso={i.lastUpdated} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ── Impact dashboard (landing) ─────────────────────────────────────────────
+
+function ImpactDashboard({ onSelectIssue, onSelectCustomer }) {
+  const [overview, setOverview] = useState(null);
+  const [topCustomers, setTopCustomers] = useState([]);
+  const [topIssues, setTopIssues] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      // Serial — each endpoint runs its own $lookup against alert_overview.
+      // Firing them in parallel piles concurrent aggregations on Mongo.
+      const o    = await apiFetch('/api/impact/overview');
+      setOverview(o.data);
+      const c    = await apiFetch('/api/impact/top-customers?limit=10');
+      setTopCustomers(c.data);
+      const i    = await apiFetch('/api/impact/top-issues?limit=10');
+      setTopIssues(i.data);
+      const cats = await apiFetch('/api/impact/categories');
+      setCategories(cats.data);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (loading) return <Spinner />;
+  if (error) return <ErrorBox msg={error} onRetry={load} />;
+  if (!overview) return null;
+
+  const pct = (n, d) => d > 0 ? `${Math.round((n / d) * 100)}% of ${d}` : '—';
+
+  return (
+    <div className="space-y-6 fade-in">
+      {/* Headline KPI strip */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiTile
+          label="Customers affected"
+          value={overview.customersAffected}
+          sub={pct(overview.customersAffected, overview.totalCustomers)}
+          accent="#b91c1c"
+          tone="bg-red-50/60 border-red-200"
+        />
+        <KpiTile
+          label="Sites affected"
+          value={overview.sitesAffected}
+          sub={pct(overview.sitesAffected, overview.totalSites)}
+          accent="#b91c1c"
+          tone="bg-red-50/60 border-red-200"
+        />
+        <KpiTile
+          label="Active issues"
+          value={overview.instances}
+          sub={`${overview.criticalCount} critical · ${overview.warningCount} warning`}
+          accent="#0f172a"
+        />
+        <KpiTile
+          label="Coverage"
+          value={overview.totalSubscriptions.toLocaleString('en-IN')}
+          sub={`${overview.totalCustomers} customers · ${overview.totalSites.toLocaleString('en-IN')} sites tracked`}
+          accent="#0f172a"
+        />
+      </div>
+
+      {/* Top customers + Top issues side-by-side */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <ImpactCustomersTable rows={topCustomers} onSelectCustomer={onSelectCustomer} />
+        <ImpactIssuesTable rows={topIssues} onSelectIssue={onSelectIssue} />
+      </div>
+
+      {/* Categories */}
+      {categories.length > 0 && (
+        <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-100">
+            <h3 className="text-sm font-bold text-gray-800">By category</h3>
+            <p className="text-xs text-gray-500 mt-0.5">Issue rollup by product module.</p>
+          </div>
+          <div className="px-4 py-4 space-y-2">
+            {(() => {
+              const max = Math.max(1, ...categories.map((c) => c.instances));
+              return categories.map((c, idx) => (
+                <div key={c.module} className="flex items-center gap-3">
+                  <span className="w-28 shrink-0 text-sm font-medium text-gray-700 capitalize">{c.module}</span>
+                  <div className="flex-1 h-6 bg-gray-100 rounded overflow-hidden">
+                    <div
+                      className="h-full rounded flex items-center px-2 text-xs font-semibold text-white"
+                      style={{ width: `${(c.instances / max) * 100}%`, background: PALETTE[idx % PALETTE.length] }}
+                    >
+                      {c.instances}
+                    </div>
+                  </div>
+                  <span className="w-44 shrink-0 text-right text-xs text-gray-500">
+                    {c.customersAffected} customers · {c.signalsAffected} issue{c.signalsAffected !== 1 ? 's' : ''}
+                  </span>
+                </div>
+              ));
+            })()}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. Customers tab — list, drilldown, "affected customers" panel
+// ═════════════════════════════════════════════════════════════════════════════
+
+function CustomersScreen({ onSelectCustomer }) {
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [showOnlyAffected, setShowOnlyAffected] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null);
+    try { const { data } = await apiFetch('/api/customers'); setCustomers(data); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const baseList = useMemo(
+    () => showOnlyAffected ? customers.filter((c) => c.issuesFiring > 0) : customers,
+    [customers, showOnlyAffected]
+  );
+  const sf = useSortFilter(baseList, {
+    defaultKey: 'critical', defaultDir: 'desc',
+    filterFn: (r, n) => r.tenantCode.toLowerCase().includes(n),
+  });
+
+  if (loading) return <Spinner />;
+  if (error) return <ErrorBox msg={error} onRetry={load} />;
+
+  return (
+    <div className="space-y-4 fade-in">
+      <div className="flex flex-wrap items-center gap-3">
+        <input
+          type="text"
+          value={sf.q}
+          onChange={(e) => sf.setQ(e.target.value)}
+          placeholder="Search customer…"
+          className="flex-1 min-w-[200px] max-w-sm rounded border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+        />
+        <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer">
+          <input type="checkbox" checked={showOnlyAffected} onChange={(e) => setShowOnlyAffected(e.target.checked)} />
+          Only with active issues
+        </label>
+        <span className="ml-auto text-xs text-gray-400">{sf.rows.length} of {customers.length}</span>
+      </div>
+
+      <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 sticky top-0">
+            <tr>
+              <SortHeader label="Customer" k="tenantCode" {...sf} />
+              <SortHeader label="Sites" k="sites" align="right" {...sf} />
+              <SortHeader label="Subscribed issues" k="signalsSubscribed" align="right" {...sf} />
+              <SortHeader label="Active issues" k="issuesFiring" align="right" {...sf} />
+              <SortHeader label="Critical" k="critical" align="right" {...sf} />
+              <SortHeader label="Last updated" k="lastUpdated" align="right" {...sf} />
+            </tr>
+          </thead>
+          <tbody>
+            {sf.rows.map((c) => (
+              <tr
+                key={c.tenantCode}
+                onClick={() => onSelectCustomer(c.tenantCode)}
+                className="border-t border-gray-100 hover:bg-blue-50/40 cursor-pointer"
+              >
+                <td className="px-4 py-2 font-medium text-gray-800">{c.tenantCode}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">{c.sites}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">{c.signalsSubscribed}</td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {c.issuesFiring > 0
+                    ? <span className="font-bold text-gray-800">{c.issuesFiring}</span>
+                    : <span className="text-gray-300">0</span>}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {c.critical > 0 ? <span className="font-bold text-red-600">{c.critical}</span> : <span className="text-gray-300">0</span>}
+                </td>
+                <td className="px-3 py-2 text-right"><RelTime iso={c.lastUpdated} /></td>
+              </tr>
+            ))}
+            {sf.rows.length === 0 && (
+              <tr><td colSpan="6" className="px-4 py-8 text-center text-sm text-gray-400">No customers match</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Customer drilldown tables ─────────────────────────────────────────────
+
+function CustomerIssuesTable({ rows, onSelectIssue }) {
+  const sf = useSortFilter(rows, {
+    defaultKey: 'critical', defaultDir: 'desc',
+    filterFn: (r, n) => (r.name || '').toLowerCase().includes(n) || (r.module || '').toLowerCase().includes(n),
+  });
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-100">
+        <h3 className="text-sm font-bold text-gray-800">Active issues for this customer</h3>
+      </div>
+      <TableFilter value={sf.q} onChange={sf.setQ} placeholder="Filter issue or module…" count={sf.rows.length} total={rows.length} />
+      {rows.length === 0 ? (
+        <p className="px-4 py-6 text-sm text-gray-400 text-center">No active issues.</p>
+      ) : (
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <SortHeader label="Issue" k="name" {...sf} />
+              <SortHeader label="Sites" k="sitesAffected" align="right" {...sf} />
+              <SortHeader label="Critical" k="critical" align="right" {...sf} />
+              <SortHeader label="Last updated" k="lastUpdated" align="right" {...sf} />
+            </tr>
+          </thead>
+          <tbody>
+            {sf.rows.map((iss) => (
+              <tr
+                key={iss.signalId}
+                onClick={() => onSelectIssue && onSelectIssue({
+                  _id: iss.signalId, name: iss.name, module: iss.module,
+                  signalCode: iss.signalCode, description: '',
+                  severityCounts: { CRITICAL: iss.critical, WARNING: iss.warning, LOW: 0 },
+                })}
+                className="border-t border-gray-100 hover:bg-blue-50/40 cursor-pointer"
+              >
+                <td className="px-4 py-2">
+                  <p className="font-medium text-gray-800 leading-tight">{iss.name}</p>
+                  <p className="text-[11px] text-gray-400 mt-0.5 uppercase tracking-wide">{iss.module || '—'}</p>
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">{iss.sitesAffected}</td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {iss.critical > 0 ? <span className="font-bold text-red-600">{iss.critical}</span> : <span className="text-gray-400">0</span>}
+                </td>
+                <td className="px-3 py-2 text-right"><RelTime iso={iss.lastUpdated} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function CustomerSitesTable({ rows }) {
+  const sf = useSortFilter(rows, {
+    defaultKey: 'critical', defaultDir: 'desc',
+    filterFn: (r, n) => (r.facilityCode || '').toLowerCase().includes(n),
+  });
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-100">
+        <h3 className="text-sm font-bold text-gray-800">Sites with active issues</h3>
+      </div>
+      <TableFilter value={sf.q} onChange={sf.setQ} placeholder="Filter site…" count={sf.rows.length} total={rows.length} />
+      {rows.length === 0 ? (
+        <p className="px-4 py-6 text-sm text-gray-400 text-center">No sites currently affected.</p>
+      ) : (
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <SortHeader label="Site" k="facilityCode" {...sf} />
+              <SortHeader label="Issues" k="signalsAffected" align="right" {...sf} />
+              <SortHeader label="Critical" k="critical" align="right" {...sf} />
+              <SortHeader label="Last updated" k="lastUpdated" align="right" {...sf} />
+            </tr>
+          </thead>
+          <tbody>
+            {sf.rows.map((s) => (
+              <tr key={s.facilityCode} className="border-t border-gray-100">
+                <td className="px-4 py-2 font-mono text-gray-700">{s.facilityCode}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-700">{s.signalsAffected}</td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {s.critical > 0 ? <span className="font-bold text-red-600">{s.critical}</span> : <span className="text-gray-400">0</span>}
+                </td>
+                <td className="px-3 py-2 text-right"><RelTime iso={s.lastUpdated} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ── Customer drilldown ────────────────────────────────────────────────────
+
+function CustomerDetailScreen({ tenantCode, onBack, onSelectIssue }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError(null);
+    apiFetch(`/api/customers/${encodeURIComponent(tenantCode)}`)
+      .then((r) => { if (!cancelled) setData(r.data); })
+      .catch((e) => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [tenantCode]);
+
+  if (loading) return <Spinner />;
+  if (error) return <ErrorBox msg={error} />;
+  if (!data) return null;
+  const { summary, issues, sites } = data;
+
+  return (
+    <div className="space-y-5 fade-in">
+      <div>
+        <BackButton onClick={onBack} label="All Customers" />
+        <h2 className="text-xl font-bold text-gray-900 mt-2">{tenantCode}</h2>
+        <p className="text-sm text-gray-500 mt-1">
+          {summary.sites} sites · subscribed to {summary.signalsSubscribed} issue{summary.signalsSubscribed !== 1 ? 's' : ''} · {summary.subscriptions.toLocaleString('en-IN')} subscriptions
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiTile label="Active issues" value={summary.issuesFiring} accent="#0f172a" />
+        <KpiTile label="Critical" value={summary.critical} accent="#b91c1c" tone="bg-red-50/60 border-red-200" />
+        <KpiTile label="Warning" value={summary.warning} accent="#b45309" tone="bg-amber-50/60 border-amber-200" />
+        <KpiTile label="Sites affected" value={summary.sitesAffected} sub={`of ${summary.sites}`} accent="#0e7490" tone="bg-cyan-50/60 border-cyan-200" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <CustomerIssuesTable rows={issues} onSelectIssue={onSelectIssue} />
+        <CustomerSitesTable rows={sites} />
+      </div>
+    </div>
+  );
+}
+
+// ── Affected Customers panel (used inside Issue detail) ───────────────────
+
+function AffectedCustomersPanel({ signalId, onSelectCustomer }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError(null);
+    apiFetch(`/api/signals/${signalId}/customers`)
+      .then((r) => { if (!cancelled) setRows(r.data || []); })
+      .catch((e) => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [signalId]);
+
+  const sf = useSortFilter(rows, {
+    defaultKey: 'critical', defaultDir: 'desc',
+    filterFn: (r, n) => r.tenantCode.toLowerCase().includes(n),
+  });
+
+  if (loading) return <Spinner />;
+  if (error) return <ErrorBox msg={error} />;
+  if (rows.length === 0) {
+    return <p className="text-sm text-gray-400 py-6 text-center">No customers currently affected by this issue.</p>;
+  }
+
+  const sortBys = [
+    { k: 'critical', label: 'Critical' },
+    { k: 'warning', label: 'Warning' },
+    { k: 'instances', label: 'Sites' },
+    { k: 'tenantCode', label: 'Customer' },
+  ];
+
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center gap-3 flex-wrap">
+        <div>
+          <h3 className="text-sm font-bold text-gray-800">Affected customers ({rows.length})</h3>
+          <p className="text-xs text-gray-500 mt-0.5">Click a row to expand sites; click the customer to drill into their full view.</p>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-xs text-gray-500">Sort by</span>
+          <select
+            value={sf.sortKey || ''}
+            onChange={(e) => sf.onSort(e.target.value)}
+            className="rounded border border-gray-300 px-2 py-1 text-xs focus:outline-none focus:border-blue-500 bg-white"
+          >
+            {sortBys.map((s) => (<option key={s.k} value={s.k}>{s.label}</option>))}
+          </select>
+          <button
+            onClick={() => sf.onSort(sf.sortKey)}
+            className="rounded border border-gray-300 px-2 py-1 text-xs hover:bg-gray-50"
+            title="Toggle sort direction"
+          >
+            {sf.sortDir === 'asc' ? '▲ asc' : '▼ desc'}
+          </button>
+        </div>
+      </div>
+      <TableFilter value={sf.q} onChange={sf.setQ} placeholder="Filter customer…" count={sf.rows.length} total={rows.length} />
+      <div className="divide-y divide-gray-100">
+        {sf.rows.map((r) => {
+          const isOpen = expanded === r.tenantCode;
+          return (
+            <div key={r.tenantCode}>
+              <div className="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 cursor-pointer"
+                   onClick={() => setExpanded(isOpen ? null : r.tenantCode)}>
+                <button className="text-sm font-semibold text-blue-700 hover:underline" onClick={(e) => { e.stopPropagation(); onSelectCustomer(r.tenantCode); }}>
+                  {r.tenantCode}
+                </button>
+                <span className="text-xs text-gray-500">{r.instances} site{r.instances !== 1 ? 's' : ''}</span>
+                {r.critical > 0 && <span className="text-xs font-semibold px-2 py-0.5 rounded bg-red-100 text-red-700">{r.critical} critical</span>}
+                {r.warning > 0 && <span className="text-xs font-semibold px-2 py-0.5 rounded bg-amber-100 text-amber-700">{r.warning} warning</span>}
+                <span className="text-xs text-gray-400" title={fmtTime(r.lastUpdated)}>· updated {fmtRelTime(r.lastUpdated)}</span>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2"
+                  className="ml-auto text-gray-400" style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
+                  <path d="M2 4l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              {isOpen && (
+                <div className="px-4 pb-3 pt-1 bg-gray-50/50">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-gray-500">
+                        <th className="text-left py-1 font-semibold">Site</th>
+                        <th className="text-left py-1 font-semibold">Severity</th>
+                        <th className="text-left py-1 font-semibold">Headline</th>
+                        <th className="text-right py-1 font-semibold">Updated</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {r.sites.map((s, i) => (
+                        <tr key={i} className="border-t border-gray-100">
+                          <td className="py-1 font-mono text-gray-700">{s.facilityCode || '—'}</td>
+                          <td className="py-1"><SeverityPill sev={(s.severity || '').toUpperCase()} /></td>
+                          <td className="py-1 text-gray-700 truncate max-w-md" title={s.heading || ''}>{s.heading || '—'}</td>
+                          <td className="py-1 text-right text-gray-500">{fmtTime(s.updatedAt)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Subscriptions tab — overview, browse list, coverage matrix
+// ═════════════════════════════════════════════════════════════════════════════
+
+function SubscriptionsByIssueTable({ rows, onSelectIssue }) {
+  const sf = useSortFilter(rows, {
+    defaultKey: 'customers', defaultDir: 'desc',
+    filterFn: (r, n) => (r.name || '').toLowerCase().includes(n) || (r.module || '').toLowerCase().includes(n),
+  });
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-100">
+        <h3 className="text-sm font-bold text-gray-800">Subscriptions by issue</h3>
+        <p className="text-xs text-gray-500 mt-0.5">How many customers and sites are subscribed to each issue.</p>
+      </div>
+      <TableFilter value={sf.q} onChange={sf.setQ} placeholder="Filter issue or module…" count={sf.rows.length} total={rows.length} />
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50">
+          <tr>
+            <SortHeader label="Issue" k="name" {...sf} />
+            <SortHeader label="Customers" k="customers" align="right" {...sf} />
+            <SortHeader label="Sites" k="sites" align="right" {...sf} />
+            <SortHeader label="Subscriptions" k="subscriptions" align="right" {...sf} />
+            <SortHeader label="Active" k="activeSubs" align="right" {...sf} />
+          </tr>
+        </thead>
+        <tbody>
+          {sf.rows.map((r) => (
+            <tr
+              key={r.signalId}
+              onClick={() => onSelectIssue && onSelectIssue({
+                _id: r.signalId, name: r.name, module: r.module,
+                signalCode: r.signalCode, description: '',
+                severityCounts: { CRITICAL: 0, WARNING: 0, LOW: 0 },
+              })}
+              className="border-t border-gray-100 hover:bg-blue-50/40 cursor-pointer"
+            >
+              <td className="px-4 py-2">
+                <p className="font-medium text-gray-800 leading-tight">{r.name}</p>
+                <p className="text-[11px] text-gray-400 mt-0.5 uppercase tracking-wide">{r.module || '—'}{!r.isActive && ' · inactive'}</p>
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums text-gray-700">{r.customers}</td>
+              <td className="px-3 py-2 text-right tabular-nums text-gray-500">{r.sites.toLocaleString('en-IN')}</td>
+              <td className="px-3 py-2 text-right tabular-nums text-gray-500">{r.subscriptions.toLocaleString('en-IN')}</td>
+              <td className="px-3 py-2 text-right tabular-nums text-gray-700">{r.activeSubs.toLocaleString('en-IN')}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Subscriptions screen ──────────────────────────────────────────────────
+
+function SubscriptionsScreen({ onSelectCustomer, onSelectIssue, view: viewProp, onViewChange }) {
+  const view = VALID_SUB_VIEWS.includes(viewProp) ? viewProp : 'overview';
+  const setView = onViewChange || (() => {});
+  const [overview, setOverview] = useState(null);
+  const [byIssue, setByIssue] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setError(null);
+      try {
+        const o = await apiFetch('/api/subscriptions/overview');
+        if (cancelled) return;
+        setOverview(o.data);
+        const i = await apiFetch('/api/subscriptions/by-issue');
+        if (cancelled) return;
+        setByIssue(i.data);
+      } catch (e) { if (!cancelled) setError(e.message); }
+      finally { if (!cancelled) setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (loading) return <Spinner />;
+  if (error) return <ErrorBox msg={error} />;
+  if (!overview) return null;
+
+  const subTabs = [
+    { key: 'overview', label: 'Overview' },
+    { key: 'list', label: 'Browse' },
+    { key: 'matrix', label: 'Coverage matrix' },
+  ];
+
+  return (
+    <div className="space-y-5 fade-in">
+      <div className="flex items-center gap-1 border-b border-gray-200">
+        {subTabs.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => setView(t.key)}
+            className={`px-3 py-2 text-sm font-semibold transition-colors border-b-2 -mb-px ${
+              view === t.key
+                ? 'border-blue-600 text-blue-700'
+                : 'border-transparent text-gray-500 hover:text-gray-800'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {view === 'overview' && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <KpiTile label="Total subscriptions" value={overview.totalSubscriptions.toLocaleString('en-IN')} sub={`${overview.activeSubscriptions.toLocaleString('en-IN')} active`} />
+            <KpiTile label="Inactive" value={overview.inactiveSubscriptions.toLocaleString('en-IN')} sub={`${Math.round((overview.inactiveSubscriptions / Math.max(1, overview.totalSubscriptions)) * 100)}% of total`} accent="#9ca3af" />
+            <KpiTile label="Customers covered" value={overview.customersCovered} sub={`${overview.sitesCovered.toLocaleString('en-IN')} sites`} accent="#0e7490" tone="bg-cyan-50/60 border-cyan-200" />
+            <KpiTile label="Issues with subscribers" value={`${overview.issuesWithSubscribers} / ${overview.totalSignals}`} accent="#0f172a" />
+            <KpiTile label="Subs per customer" value={overview.medianSubsPerCustomer} sub={`avg ${overview.avgSubsPerCustomer} · max ${overview.maxSubsPerCustomer.toLocaleString('en-IN')}`} accent="#0f172a" />
+          </div>
+
+          <SubscriptionsByIssueTable rows={byIssue} onSelectIssue={onSelectIssue} />
+        </>
+      )}
+
+      {view === 'list' && (
+        <SubscriptionsList byIssue={byIssue} onSelectCustomer={onSelectCustomer} />
+      )}
+
+      {view === 'matrix' && (
+        <SubscriptionsMatrix onSelectCustomer={onSelectCustomer} onSelectIssue={onSelectIssue} />
+      )}
+    </div>
+  );
+}
+
+function SubscriptionsList({ byIssue, onSelectCustomer }) {
+  const [q, setQ] = useState('');
+  const [signal, setSignal] = useState('');
+  const [active, setActive] = useState(''); // '', 'true', 'false'
+  const [skip, setSkip] = useState(0);
+  const [limit] = useState(100);
+  const [data, setData] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const debounceRef = useRef(null);
+  const load = useCallback(() => {
+    setLoading(true); setError(null);
+    const params = new URLSearchParams({ limit: String(limit), skip: String(skip) });
+    if (q.trim()) params.set('q', q.trim());
+    if (signal) params.set('signal', signal);
+    if (active) params.set('active', active);
+    apiFetch(`/api/subscriptions/list?${params}`)
+      .then((r) => { setData(r.data); setTotal(r.total); })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [q, signal, active, skip, limit]);
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(load, 200);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [load]);
+
+  const onFilterChange = (setter) => (e) => { setSkip(0); setter(e.target.value); };
+
+  const sf = useSortFilter(data, { defaultKey: 'tenantCode', defaultDir: 'asc' });
+
+  const page = Math.floor(skip / limit) + 1;
+  const lastPage = Math.max(1, Math.ceil(total / limit));
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="text" value={q} onChange={onFilterChange(setQ)} placeholder="Search customer, site, fingerprint…"
+          className="flex-1 min-w-[220px] max-w-md rounded border border-gray-300 px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500"
+        />
+        <select value={signal} onChange={onFilterChange(setSignal)}
+          className="rounded border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:border-blue-500">
+          <option value="">All issues</option>
+          {byIssue.map((i) => (<option key={i.signalId} value={i.signalId}>{i.name}</option>))}
+        </select>
+        <select value={active} onChange={onFilterChange(setActive)}
+          className="rounded border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:border-blue-500">
+          <option value="">Active + inactive</option>
+          <option value="true">Active only</option>
+          <option value="false">Inactive only</option>
+        </select>
+        <span className="ml-auto text-xs text-gray-500">{total.toLocaleString('en-IN')} match{total !== 1 ? 'es' : ''}</span>
+      </div>
+
+      {error && <ErrorBox msg={error} />}
+
+      <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <SortHeader label="Customer" k="tenantCode" {...sf} />
+                <SortHeader label="Site" k="facilityCode" {...sf} />
+                <SortHeader label="Issue" k="signalName" {...sf} />
+                <SortHeader label="Status" k="isSubscribed" {...sf} />
+                <SortHeader label="Schedule" k="signalModule" {...sf} />
+                <SortHeader label="Updated" k="updatedAt" {...sf} />
+              </tr>
+            </thead>
+            <tbody>
+              {loading && (
+                <tr><td colSpan="6" className="px-3 py-6 text-center"><Spinner /></td></tr>
+              )}
+              {!loading && sf.rows.map((r) => (
+                <tr key={r._id} className="border-t border-gray-100">
+                  <td className="px-3 py-1.5">
+                    <button className="font-medium text-blue-700 hover:underline" onClick={() => onSelectCustomer(r.tenantCode)}>{r.tenantCode}</button>
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-xs text-gray-700">{r.facilityCode || '—'}</td>
+                  <td className="px-3 py-1.5">
+                    <p className="text-xs text-gray-800 leading-tight">{r.signalName || r.signalId}</p>
+                    {r.signalModule && <p className="text-[10px] text-gray-400 uppercase tracking-wide">{r.signalModule}</p>}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    {r.isSubscribed
+                      ? <span className="text-xs font-semibold px-2 py-0.5 rounded bg-green-100 text-green-700">Active</span>
+                      : <span className="text-xs font-semibold px-2 py-0.5 rounded bg-gray-100 text-gray-600">Inactive</span>}
+                  </td>
+                  <td className="px-3 py-1.5 text-xs text-gray-600">
+                    {r.config?.interval || '—'}{r.config?.timezone ? ` · ${r.config.timezone}` : ''}
+                  </td>
+                  <td className="px-3 py-1.5 text-xs text-gray-500">{fmtTime(r.updatedAt)}</td>
+                </tr>
+              ))}
+              {!loading && sf.rows.length === 0 && (
+                <tr><td colSpan="6" className="px-3 py-6 text-center text-sm text-gray-400">No subscriptions match</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex items-center justify-between px-3 py-2 border-t border-gray-100 bg-gray-50 text-xs text-gray-600">
+          <span>Page {page} / {lastPage}</span>
+          <div className="flex gap-2">
+            <button onClick={() => setSkip(Math.max(0, skip - limit))} disabled={skip === 0}
+              className="px-2 py-1 rounded border border-gray-300 disabled:opacity-40 hover:bg-white">Prev</button>
+            <button onClick={() => setSkip(skip + limit)} disabled={skip + limit >= total}
+              className="px-2 py-1 rounded border border-gray-300 disabled:opacity-40 hover:bg-white">Next</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SubscriptionsMatrix({ onSelectCustomer, onSelectIssue }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [q, setQ] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch('/api/subscriptions/matrix')
+      .then((r) => { if (!cancelled) setData(r.data); })
+      .catch((e) => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (loading) return <Spinner />;
+  if (error) return <ErrorBox msg={error} />;
+  if (!data) return null;
+
+  const filtered = q.trim()
+    ? data.customers.filter((c) => c.tenantCode.toLowerCase().includes(q.trim().toLowerCase()))
+    : data.customers;
+
+  const max = Math.max(1, ...filtered.flatMap((c) => Object.values(c.totals)));
+  const cellBg = (n) => n === 0 ? '#f8fafc' : `rgba(37,99,235,${0.15 + (n / max) * 0.75})`;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-3">
+        <input
+          type="text" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter customers…"
+          className="flex-1 max-w-sm rounded border border-gray-300 px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500"
+        />
+        <span className="ml-auto text-xs text-gray-500">{filtered.length} customers · {data.issues.length} issues</span>
+      </div>
+
+      <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-x-auto">
+        <table className="text-xs border-collapse" style={{ minWidth: 200 + data.issues.length * 90 }}>
+          <thead>
+            <tr>
+              <th className="sticky left-0 bg-white text-left px-3 py-2 text-[11px] uppercase tracking-wide text-gray-500 font-semibold border-b border-gray-200" style={{ minWidth: 180 }}>Customer</th>
+              {data.issues.map((iss) => (
+                <th key={iss.signalId} className="px-2 py-2 text-[11px] text-gray-600 font-semibold border-b border-gray-200 text-center"
+                    style={{ minWidth: 88, maxWidth: 88 }}>
+                  <button
+                    onClick={() => onSelectIssue && onSelectIssue({
+                      _id: iss.signalId, name: iss.name, module: iss.module,
+                      signalCode: iss.signalCode, description: '',
+                      severityCounts: { CRITICAL: 0, WARNING: 0, LOW: 0 },
+                    })}
+                    className="text-left hover:underline w-full break-words leading-tight"
+                    title={iss.name}
+                  >
+                    {iss.name}
+                  </button>
+                </th>
+              ))}
+              <th className="text-right px-3 py-2 text-[11px] uppercase tracking-wide text-gray-500 font-semibold border-b border-gray-200">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.slice(0, 200).map((c) => (
+              <tr key={c.tenantCode} className="hover:bg-blue-50/30">
+                <td className="sticky left-0 bg-white px-3 py-1.5 font-medium text-gray-800 border-t border-gray-100">
+                  <button onClick={() => onSelectCustomer(c.tenantCode)} className="text-blue-700 hover:underline">{c.tenantCode}</button>
+                </td>
+                {data.issues.map((iss) => {
+                  const n = c.totals[iss.signalId] || 0;
+                  return (
+                    <td key={iss.signalId} className="text-center border-t border-gray-100 p-0.5">
+                      <div className="rounded font-semibold mx-auto flex items-center justify-center"
+                           style={{ width: 70, height: 24, background: cellBg(n), color: n > 0 ? '#1e3a8a' : '#cbd5e1', fontSize: 11 }}
+                           title={`${c.tenantCode} · ${iss.name}: ${n} subscription${n !== 1 ? 's' : ''}`}>
+                        {n || ''}
+                      </div>
+                    </td>
+                  );
+                })}
+                <td className="text-right tabular-nums px-3 py-1.5 font-semibold text-gray-800 border-t border-gray-100">{c.total.toLocaleString('en-IN')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {filtered.length > 200 && (
+          <p className="text-xs text-gray-400 px-3 py-2 border-t border-gray-100">Showing first 200 of {filtered.length} — use the filter to narrow.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. App root — tab router, URL sync, drilldown resolution
+// ═════════════════════════════════════════════════════════════════════════════
+
+const TABS = [
+  { key: 'impact',        label: 'Impact' },
+  { key: 'customers',     label: 'Customers' },
+  { key: 'issues',        label: 'Issues' },
+  { key: 'subscriptions', label: 'Subscriptions' },
+];
 
 function App() {
-  const [selectedSignal, setSelectedSignal] = useState(null);
+  // Initialize directly from URL so refresh / direct links land on the right view.
+  const initial = useMemo(() => parseHash(), []);
+  const [tab, setTab] = useState(initial.tab);
+  const [selectedIssueId, setSelectedIssueId] = useState(initial.tab === 'issues' ? initial.detail : null);
+  const [selectedCustomer, setSelectedCustomer] = useState(initial.tab === 'customers' ? initial.detail : null);
+  const [subView, setSubView] = useState(
+    initial.tab === 'subscriptions' && VALID_SUB_VIEWS.includes(initial.detail) ? initial.detail : 'overview'
+  );
+  const [selectedIssue, setSelectedIssue] = useState(null); // resolved signal object
+
+  // When we have a signalId from URL but not the full signal metadata, resolve it
+  // by hitting /api/signals once and finding by _id.
+  useEffect(() => {
+    if (!selectedIssueId) { setSelectedIssue(null); return; }
+    if (selectedIssue && selectedIssue._id === selectedIssueId) return;
+    let cancelled = false;
+    apiFetch('/api/signals')
+      .then((r) => {
+        if (cancelled) return;
+        const sig = (r.data || []).find((s) => s._id === selectedIssueId);
+        if (sig) setSelectedIssue(sig);
+      })
+      .catch(() => { /* leave selectedIssue unset; SignalDetailScreen guards */ });
+    return () => { cancelled = true; };
+  }, [selectedIssueId, selectedIssue]);
+
+  // Push the current state to the URL on every change.
+  useEffect(() => {
+    let detail = null;
+    if (tab === 'customers') detail = selectedCustomer;
+    else if (tab === 'issues') detail = selectedIssueId;
+    else if (tab === 'subscriptions' && subView !== 'overview') detail = subView;
+    const next = buildHash(tab, detail);
+    if (window.location.hash !== next) {
+      window.history.pushState(null, '', next);
+    }
+  }, [tab, selectedCustomer, selectedIssueId, subView]);
+
+  // React to browser back/forward and external hash changes.
+  useEffect(() => {
+    const onHash = () => {
+      const p = parseHash();
+      setTab(p.tab);
+      setSelectedIssueId(p.tab === 'issues' ? p.detail : null);
+      setSelectedCustomer(p.tab === 'customers' ? p.detail : null);
+      setSubView(
+        p.tab === 'subscriptions' && VALID_SUB_VIEWS.includes(p.detail) ? p.detail : 'overview'
+      );
+    };
+    window.addEventListener('hashchange', onHash);
+    window.addEventListener('popstate', onHash);
+    return () => {
+      window.removeEventListener('hashchange', onHash);
+      window.removeEventListener('popstate', onHash);
+    };
+  }, []);
+
+  const goToIssue = useCallback((sig) => {
+    setSelectedCustomer(null);
+    setSelectedIssue(sig);
+    setSelectedIssueId(sig?._id || null);
+    setTab('issues');
+  }, []);
+  const goToCustomer = useCallback((tc) => {
+    setSelectedIssue(null);
+    setSelectedIssueId(null);
+    setSelectedCustomer(tc);
+    setTab('customers');
+  }, []);
+
+  // Clicking a tab resets drilldowns / sub-views so each tab opens at its root.
+  const onTabClick = useCallback((k) => {
+    setTab(k);
+    setSelectedIssue(null);
+    setSelectedIssueId(null);
+    setSelectedCustomer(null);
+    setSubView('overview');
+  }, []);
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* top bar */}
       <header className="border-b border-gray-200 bg-white">
-        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center gap-4">
-          <button
-            onClick={() => setSelectedSignal(null)}
-            className="font-bold text-lg text-gray-900 hover:text-gray-600 transition-colors"
-          >
-            Alert Dashboard
-          </button>
-          {selectedSignal && (
-            <>
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#9ca3af" strokeWidth="2">
+        <div className="max-w-7xl mx-auto px-6 py-3 flex items-center gap-6">
+          <span className="font-bold text-lg text-gray-900">Signals Impact</span>
+          <nav className="flex items-center gap-1 ml-2">
+            {TABS.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => onTabClick(t.key)}
+                className={`px-3 py-1.5 rounded-md text-sm font-semibold transition-colors ${
+                  tab === t.key ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-100'
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
+          {((tab === 'issues' && selectedIssueId) || (tab === 'customers' && selectedCustomer)) && (
+            <div className="flex items-center gap-2 text-sm text-gray-500 ml-2 truncate">
+              <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="#9ca3af" strokeWidth="2">
                 <path d="M4 2l5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              <span className="text-base text-gray-500 truncate max-w-xs">{selectedSignal.name}</span>
-            </>
+              <span className="truncate max-w-xs">
+                {tab === 'issues' ? (selectedIssue?.name || selectedIssueId) : selectedCustomer}
+              </span>
+            </div>
           )}
         </div>
       </header>
 
-      {/* content */}
-      <main className="max-w-6xl mx-auto px-6 py-8">
-        {!selectedSignal ? (
+      <main className="max-w-7xl mx-auto px-6 py-6">
+        {tab === 'impact' && (
           <>
-            <div className="mb-6">
-              <h1 className="text-2xl font-bold text-gray-900">Signals</h1>
-              <p className="text-sm text-gray-500 mt-1">Click a signal to explore severity breakdown and alerts</p>
+            <div className="mb-5">
+              <h1 className="text-2xl font-bold text-gray-900">Impact</h1>
+              <p className="text-sm text-gray-500 mt-1">What's the current impact across our customers?</p>
             </div>
-            <SignalListScreen onSelectSignal={setSelectedSignal} />
+            <ImpactDashboard onSelectIssue={goToIssue} onSelectCustomer={goToCustomer} />
           </>
-        ) : (
-          <SignalDetailScreen signal={selectedSignal} onBack={() => setSelectedSignal(null)} />
+        )}
+
+        {tab === 'customers' && !selectedCustomer && (
+          <>
+            <div className="mb-5">
+              <h1 className="text-2xl font-bold text-gray-900">Customers</h1>
+              <p className="text-sm text-gray-500 mt-1">All customers and their current issue load.</p>
+            </div>
+            <CustomersScreen onSelectCustomer={setSelectedCustomer} />
+          </>
+        )}
+
+        {tab === 'customers' && selectedCustomer && (
+          <CustomerDetailScreen
+            tenantCode={selectedCustomer}
+            onBack={() => setSelectedCustomer(null)}
+            onSelectIssue={goToIssue}
+          />
+        )}
+
+        {tab === 'issues' && !selectedIssueId && (
+          <>
+            <div className="mb-5">
+              <h1 className="text-2xl font-bold text-gray-900">Issues</h1>
+              <p className="text-sm text-gray-500 mt-1">Browse all signals and drill into any issue.</p>
+            </div>
+            <SignalListScreen onSelectSignal={(sig) => goToIssue(sig)} />
+          </>
+        )}
+
+        {tab === 'issues' && selectedIssueId && !selectedIssue && (
+          <Spinner />
+        )}
+
+        {tab === 'issues' && selectedIssueId && selectedIssue && (
+          <SignalDetailScreen
+            signal={selectedIssue}
+            onBack={() => { setSelectedIssue(null); setSelectedIssueId(null); }}
+            onSelectCustomer={goToCustomer}
+          />
+        )}
+
+        {tab === 'subscriptions' && (
+          <>
+            <div className="mb-5">
+              <h1 className="text-2xl font-bold text-gray-900">Subscriptions</h1>
+              <p className="text-sm text-gray-500 mt-1">Coverage of issues across customers and sites.</p>
+            </div>
+            <SubscriptionsScreen
+              onSelectCustomer={goToCustomer}
+              onSelectIssue={goToIssue}
+              view={subView}
+              onViewChange={setSubView}
+            />
+          </>
         )}
       </main>
     </div>
