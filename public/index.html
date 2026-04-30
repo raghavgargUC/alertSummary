@@ -619,9 +619,6 @@ function HistoryEntry({ entry }) {
         {entry.lastReceived && (
           <span>Last received <span className="text-gray-600 font-medium">{fmtTime(entry.lastReceived)}</span></span>
         )}
-        {entry.lastRefreshTime && (
-          <span>Data refresh <span className="text-gray-600 font-medium">{fmtTime(entry.lastRefreshTime)}</span></span>
-        )}
       </div>
     </div>
   );
@@ -668,9 +665,6 @@ function HistoryPanel({ alert, onClose }) {
           <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1 text-xs text-gray-500">
             {alert.lastReceived && (
               <span>Last received <span className="font-medium text-gray-700">{fmtTime(alert.lastReceived)}</span></span>
-            )}
-            {alert.lastRefreshTime && (
-              <span>Data refresh <span className="font-medium text-gray-700">{fmtTime(alert.lastRefreshTime)}</span></span>
             )}
           </div>
         </div>
