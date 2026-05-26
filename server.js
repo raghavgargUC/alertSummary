@@ -48,6 +48,8 @@ const MONGO_URL = process.env.MONGO_URL;
 const DB_NAME = process.env.DB_NAME;
 const ALERT_API_BASE = process.env.ALERT_API_BASE;
 const API_KEY = process.env.API_KEY;
+const SIGNAL_ANALYSIS_BASE = process.env.SIGNAL_ANALYSIS_BASE;
+const SIGNAL_BEARER_TOKEN = process.env.SIGNAL_BEARER_TOKEN;
 
 const REQUIRED_ENV = { MONGO_URL, DB_NAME, ALERT_API_BASE, API_KEY };
 for (const [k, v] of Object.entries(REQUIRED_ENV)) {
@@ -1135,6 +1137,44 @@ app.get('/api/subscriptions/matrix', asyncRoute('/api/subscriptions/matrix', asy
     .sort((a, b) => b.total - a.total);
 
   res.json({ data: { issues, customers } });
+}));
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Feedbacks
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/feedbacks?limit=50&lastSeenFeedbackSubmittedAt=&lastSeenId=
+ * Proxies the upstream feedback API and joins signal names from signals_master.
+ * FEEDBACK_API_URL and SIGNAL_BEARER_TOKEN are optional — returns 503 if unset.
+ */
+app.get('/api/feedbacks', asyncRoute('/api/feedbacks', async (req, res) => {
+  if (!SIGNAL_ANALYSIS_BASE || !SIGNAL_BEARER_TOKEN) {
+    const err = new Error('Feedback API not configured (SIGNAL_ANALYSIS_BASE / SIGNAL_BEARER_TOKEN missing)');
+    err.statusCode = 503;
+    throw err;
+  }
+
+  const limit = clampInt(req.query.limit, 50, 200);
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (req.query.lastSeenFeedbackSubmittedAt) params.set('lastSeenFeedbackSubmittedAt', req.query.lastSeenFeedbackSubmittedAt);
+  if (req.query.lastSeenId) params.set('lastSeenId', req.query.lastSeenId);
+
+  const [upstream, nameMap] = await Promise.all([
+    axios.get(`${SIGNAL_ANALYSIS_BASE}/feedbacks?${params}`, {
+      headers: { Authorization: `Bearer ${SIGNAL_BEARER_TOKEN}` },
+      timeout: 15_000,
+    }),
+    loadSignalNameMap(),
+  ]);
+
+  const raw = upstream.data?.data ?? upstream.data ?? [];
+  const data = (Array.isArray(raw) ? raw : []).map((f) => ({
+    ...f,
+    signalName: nameMap.get(String(f.signalId))?.name ?? null,
+  }));
+
+  res.json({ data });
 }));
 
 // ═════════════════════════════════════════════════════════════════════════════
