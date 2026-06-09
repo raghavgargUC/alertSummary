@@ -1140,6 +1140,60 @@ app.get('/api/subscriptions/matrix', asyncRoute('/api/subscriptions/matrix', asy
 }));
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Signal-analysis service — shared guard
+// ═════════════════════════════════════════════════════════════════════════════
+
+function requireSignalAnalysis() {
+  if (!SIGNAL_ANALYSIS_BASE || !SIGNAL_BEARER_TOKEN) {
+    const err = new Error('Signal analysis service not configured (SIGNAL_ANALYSIS_BASE / SIGNAL_BEARER_TOKEN missing)');
+    err.statusCode = 503;
+    throw err;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// User-activity export
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/customers/:tenantCode/activity-export?from=&to=
+ * Proxies the upstream CSV export and streams it straight to the browser so
+ * the Bearer token never leaves the server.
+ */
+app.get('/api/customers/:tenantCode/activity-export', asyncRoute(
+  '/api/customers/:tenantCode/activity-export',
+  async (req, res) => {
+    requireSignalAnalysis();
+    const { tenantCode } = req.params;
+    const params = new URLSearchParams({ tenantCode });
+    if (req.query.from) params.set('from', req.query.from);
+    if (req.query.to)   params.set('to',   req.query.to);
+
+    // user-activity lives at the service root, not under /signal-analysis
+    const serviceRoot = new URL(SIGNAL_ANALYSIS_BASE).origin;
+    const upstream = await axios.get(
+      `${serviceRoot}/user-activity/export?${params}`,
+      {
+        headers:      { Authorization: `Bearer ${SIGNAL_BEARER_TOKEN}` },
+        responseType: 'stream',
+        timeout:      60_000,
+      }
+    );
+
+    res.setHeader(
+      'Content-Type',
+      upstream.headers['content-type'] || 'text/csv; charset=utf-8'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      upstream.headers['content-disposition'] ||
+        `attachment; filename="${tenantCode}-activity.csv"`
+    );
+    upstream.data.pipe(res);
+  }
+));
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Feedbacks
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1149,11 +1203,7 @@ app.get('/api/subscriptions/matrix', asyncRoute('/api/subscriptions/matrix', asy
  * FEEDBACK_API_URL and SIGNAL_BEARER_TOKEN are optional — returns 503 if unset.
  */
 app.get('/api/feedbacks', asyncRoute('/api/feedbacks', async (req, res) => {
-  if (!SIGNAL_ANALYSIS_BASE || !SIGNAL_BEARER_TOKEN) {
-    const err = new Error('Feedback API not configured (SIGNAL_ANALYSIS_BASE / SIGNAL_BEARER_TOKEN missing)');
-    err.statusCode = 503;
-    throw err;
-  }
+  requireSignalAnalysis();
 
   const limit = clampInt(req.query.limit, 50, 200);
   const params = new URLSearchParams({ limit: String(limit) });
