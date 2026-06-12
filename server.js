@@ -1228,6 +1228,236 @@ app.get('/api/feedbacks', asyncRoute('/api/feedbacks', async (req, res) => {
 }));
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Adoption — Co-pilot signal engagement
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Internal tenants always excluded from adoption metrics — no override. */
+const INTERNAL_TENANTS = Object.freeze(['demostaging', 'recostaging']);
+
+const ADOPTION_WINDOW_START = '2026-06-01';
+
+/**
+ * Parse IST YYYY-MM-DD date strings into a UTC Date range for MongoDB queries.
+ * Converts IST midnight → UTC so MongoDB range queries hit the right docs.
+ */
+function parseAdoptionDateRange(fromStr, toStr) {
+  const from = (fromStr || ADOPTION_WINDOW_START).trim();
+  const to   = (toStr   || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })).trim();
+  const fromDate = new Date(from + 'T00:00:00+05:30');
+  // Include the full "to" day in IST: advance one IST day then use strict <
+  const toDate   = new Date(to   + 'T00:00:00+05:30');
+  toDate.setDate(toDate.getDate() + 1);
+  return { fromDate, toDate };
+}
+
+/** Parse comma-separated excluded user emails from query param. */
+function parseExcludedUsers(raw) {
+  if (!raw) return [];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/** MongoDB aggregation expression: convert a UTC Date field to an IST YYYY-MM-DD string. */
+const istDateExpr = (fieldRef) => ({
+  $dateToString: { format: '%Y-%m-%d', date: fieldRef, timezone: '+05:30' },
+});
+
+/**
+ * GET /api/adoption/fired?from=YYYY-MM-DD&to=YYYY-MM-DD&excludedUsers=a,b
+ *
+ * Counts fired signal instances from alert_overview.firedAt (UTC).
+ * Dedup key: tenantCode + facilityCode + signalId + IST date.
+ * Always excludes INTERNAL_TENANTS.
+ * Returns dimension arrays + indexed rows + coverageThrough date.
+ */
+app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res) => {
+  const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
+
+  const rows = await db.collection('alert_overview').aggregate([
+    { $match: {
+      firedAt:    { $gte: fromDate, $lt: toDate },
+      tenantCode: { $nin: INTERNAL_TENANTS },
+    } },
+    { $addFields: {
+      istDate:     istDateExpr('$firedAt'),
+      signalIdStr: { $toString: '$signalId' },
+    } },
+    { $group: {
+      _id: {
+        tenantCode:   '$tenantCode',
+        facilityCode: '$facilityCode',
+        signalId:     '$signalIdStr',
+        istDate:      '$istDate',
+      },
+      count: { $sum: 1 },
+    } },
+    { $lookup: {
+      from: 'signals_master',
+      let: { sid: '$_id.signalId' },
+      pipeline: [
+        { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$sid'] } } },
+        { $limit: 1 },
+        { $project: { name: 1, signalCode: 1 } },
+      ],
+      as: '_signal',
+    } },
+  ], { allowDiskUse: true }).toArray();
+
+  // Build dimension index arrays
+  const tenantSet  = new Set();
+  const facilitySet = new Set();
+  const signalMap  = new Map(); // signalId string → { id, name, signalCode }
+  let coverageThrough = null;
+
+  for (const r of rows) {
+    tenantSet.add(r._id.tenantCode);
+    facilitySet.add(r._id.facilityCode);
+    const sid = r._id.signalId;
+    if (!signalMap.has(sid)) {
+      const meta = r._signal?.[0] ?? {};
+      signalMap.set(sid, { id: sid, name: meta.name ?? sid, signalCode: meta.signalCode ?? null });
+    }
+    if (!coverageThrough || r._id.istDate > coverageThrough) coverageThrough = r._id.istDate;
+  }
+
+  const tenants    = [...tenantSet].sort();
+  const facilities = [...facilitySet].sort();
+  const signals    = [...signalMap.values()];
+  const tIdx       = new Map(tenants.map((t, i) => [t, i]));
+  const fIdx       = new Map(facilities.map((f, i) => [f, i]));
+  const sIdx       = new Map(signals.map((s, i) => [s.id, i]));
+
+  const firedRows = rows.map((r) => [
+    tIdx.get(r._id.tenantCode)   ?? -1,
+    fIdx.get(r._id.facilityCode) ?? -1,
+    sIdx.get(r._id.signalId)     ?? -1,
+    r._id.istDate,
+    r.count,
+  ]);
+
+  res.json({ tenants, facilities, signals, rows: firedRows, coverageThrough });
+}));
+
+/**
+ * GET /api/adoption/activity?from=YYYY-MM-DD&to=YYYY-MM-DD&excludedUsers=a,b
+ *
+ * Returns aggregated engagement events from alert_user_activity.
+ * Stage values:
+ *   1 = Open       (activityType=ANALYSIS, action=CLICKED)
+ *   3 = Resolve    (activityType=RECOMMENDATION, action=RESOLVE)
+ *   4 = Rec. Click (activityType=RECOMMENDATION, action=UNDO,
+ *                   key_data.coPilotRecommendationClicked=true)
+ *                  ↑ System bug: event is written as UNDO but actually means
+ *                    "user clicked co-pilot recommendation button".
+ *
+ * Joins alertId → alert_overview._id → signalId → signals_master.name.
+ * Always excludes INTERNAL_TENANTS and the excludedUsers list.
+ */
+app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (req, res) => {
+  const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
+  const excludedUsers = parseExcludedUsers(req.query.excludedUsers);
+
+  const baseMatch = {
+    timestamp:  { $gte: fromDate, $lt: toDate },
+    tenantCode: { $nin: INTERNAL_TENANTS },
+    $or: [
+      { activityType: 'ANALYSIS',       action: 'CLICKED' },
+      { activityType: 'RECOMMENDATION', action: 'RESOLVE' },
+      { activityType: 'RECOMMENDATION', action: 'UNDO',
+        'key_data.coPilotRecommendationClicked': true },
+    ],
+  };
+  if (excludedUsers.length > 0) baseMatch.userEmail = { $nin: excludedUsers };
+
+  const rows = await db.collection('alert_user_activity').aggregate([
+    { $match: baseMatch },
+    // Safely convert alertId string → ObjectId; returns null on invalid/missing.
+    { $addFields: {
+      _alertOid: { $convert: { input: '$alertId', to: 'objectId', onError: null } },
+    } },
+    // Join to alert_overview to get signalId.
+    { $lookup: {
+      from:         'alert_overview',
+      localField:   '_alertOid',
+      foreignField: '_id',
+      as:           '_alert',
+    } },
+    { $addFields: {
+      signalId: { $toString: { $ifNull: [{ $arrayElemAt: ['$_alert.signalId', 0] }, ''] } },
+      istDate:  istDateExpr('$timestamp'),
+      stage: { $switch: {
+        branches: [
+          { case: { $and: [{ $eq: ['$activityType', 'ANALYSIS'] },       { $eq: ['$action', 'CLICKED'] }] }, then: 1 },
+          { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'RESOLVE'] }] }, then: 3 },
+          { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'UNDO']    }] }, then: 4 },
+        ],
+        default: 0,
+      } },
+    } },
+    // Join to signals_master for signal name.
+    { $lookup: {
+      from: 'signals_master',
+      let: { sid: '$signalId' },
+      pipeline: [
+        { $match: { $expr: { $and: [
+          { $ne:  ['$$sid', ''] },
+          { $eq:  [{ $toString: '$_id' }, '$$sid'] },
+        ] } } },
+        { $limit: 1 },
+        { $project: { name: 1 } },
+      ],
+      as: '_signal',
+    } },
+    { $group: {
+      _id: {
+        tenantCode:   '$tenantCode',
+        facilityCode: '$facilityCode',
+        signalId:     '$signalId',
+        istDate:      '$istDate',
+        stage:        '$stage',
+        userEmail:    '$userEmail',
+      },
+      count:      { $sum: 1 },
+      signalName: { $first: { $ifNull: [{ $arrayElemAt: ['$_signal.name', 0] }, ''] } },
+    } },
+  ], { allowDiskUse: true }).toArray();
+
+  // Build dimension index arrays
+  const tenantSet   = new Set();
+  const facilitySet = new Set();
+  const signalMap   = new Map();
+  const userSet     = new Set();
+
+  for (const r of rows) {
+    tenantSet.add(r._id.tenantCode);
+    facilitySet.add(r._id.facilityCode);
+    const sid = r._id.signalId;
+    if (sid && !signalMap.has(sid)) signalMap.set(sid, { id: sid, name: r.signalName || sid });
+    if (r._id.userEmail) userSet.add(r._id.userEmail);
+  }
+
+  const tenants    = [...tenantSet].sort();
+  const facilities = [...facilitySet].sort();
+  const signals    = [...signalMap.values()];
+  const users      = [...userSet].sort();
+  const tIdx       = new Map(tenants.map((t, i) => [t, i]));
+  const fIdx       = new Map(facilities.map((f, i) => [f, i]));
+  const sIdx       = new Map(signals.map((s, i) => [s.id, i]));
+  const uIdx       = new Map(users.map((u, i) => [u, i]));
+
+  const actRows = rows.map((r) => [
+    tIdx.get(r._id.tenantCode)   ?? -1,
+    fIdx.get(r._id.facilityCode) ?? -1,
+    r._id.signalId ? (sIdx.get(r._id.signalId) ?? -1) : -1,
+    r._id.istDate,
+    r._id.stage,
+    r._id.userEmail ? (uIdx.get(r._id.userEmail) ?? -1) : -1,
+    r.count,
+  ]);
+
+  res.json({ tenants, facilities, signals, users, rows: actRows });
+}));
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Server bootstrap
 // ═════════════════════════════════════════════════════════════════════════════
 
