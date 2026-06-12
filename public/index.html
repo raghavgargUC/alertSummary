@@ -3150,7 +3150,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
   const grouped = new Map(); // key → bucket
 
   const ensure = (key) => {
-    if (!grouped.has(key)) grouped.set(key, { fired: 0, opens: 0, openUsers: new Set(), resolves: 0, recClicks: 0, parentTenants: new Set() });
+    if (!grouped.has(key)) grouped.set(key, { fired: 0, opens: 0, openUsers: new Set(), resolves: 0, recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
     return grouped.get(key);
   };
 
@@ -3166,7 +3166,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
     }
     return [...grouped.entries()].map(([idx, g]) => ({
       key: idx, name: merged.users[idx] || '?', label: merged.users[idx] || '?',
-      fired: null, opens: g.opens, openedBy: g.openUsers.size,
+      fired: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
       resolves: g.resolves, recClicks: g.recClicks, opensFired: null,
     }));
   }
@@ -3187,6 +3187,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
     const g = ensure(key);
     const stage = r[4], cnt = r[6];
     if (stage === 1) { g.opens += cnt; if (r[5] >= 0) g.openUsers.add(r[5]); }
+    if (stage === 2) { if (r[5] >= 0) g.reachUsers.add(r[5]); }
     if (stage === 3) g.resolves  += cnt;
     if (stage === 4) g.recClicks += cnt;
     if (axis === 'facility') g.parentTenants.add(r[0]);
@@ -3206,9 +3207,11 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
       label = `${rawName} · ${tenantNames}`;
     }
     const opensFired = g.fired > 0 ? parseFloat(((g.opens / g.fired) * 100).toFixed(1)) : null;
+    // reachUsers only meaningful at tenant/facility level; signal has no FETCH attribution
+    const reachUsers = axis === 'signal' ? null : g.reachUsers.size;
     return {
       key: idx, name: rawName, label,
-      fired: g.fired, opens: g.opens, openedBy: g.openUsers.size,
+      fired: g.fired, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
       resolves: g.resolves, recClicks: g.recClicks, opensFired,
     };
   });
@@ -3385,13 +3388,13 @@ function AdoptionScreen() {
     const isUser = axis === 'user';
     const headers = [
       axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
-      ...(isUser ? [] : ['Fired']),
+      ...(isUser ? [] : ['Fired', 'Users Reached']),
       'Opens', 'Opened by', 'Resolves', 'Rec. Clicks',
       ...(isUser ? [] : ['Opens/Fired %']),
     ];
     const dataRows = sortedRows.map((r) => [
       `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
-      ...(isUser ? [] : [r.fired ?? '']),
+      ...(isUser ? [] : [r.fired ?? '', r.reachUsers ?? '']),
       r.opens, r.openedBy, r.resolves, r.recClicks,
       ...(isUser ? [] : [r.opensFired != null ? r.opensFired.toFixed(1) : '']),
     ].join(','));
@@ -3412,6 +3415,30 @@ function AdoptionScreen() {
 
   const thCls = 'px-3 py-2 text-left text-[11px] uppercase tracking-wide font-semibold text-gray-500 cursor-pointer select-none hover:text-gray-700 whitespace-nowrap';
   const tdCls = 'px-3 py-2.5 text-sm';
+
+  // Column definitions shown on header hover
+  const COL_TIPS = {
+    name: 'Click any row name to add it as a filter chip and drill deeper. Chips combine freely across Tenant → Facility → Signal → User.',
+    fired: 'Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt. Not shown at user level — firing has no user attribution.',
+    reachUsers: 'Distinct users who viewed the alerts list (GET_ALL_ALERTS / FETCH events) for this tenant or facility. Shows who has visibility of the alerts page, regardless of whether they opened any specific alert. Not available at signal or user level.',
+    opens: 'Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). Source: alert_user_activity.',
+    openedBy: 'Distinct user emails with at least one Open in this slice. Source: alert_user_activity.',
+    resolves: 'Count of RECOMMENDATION + RESOLVE events. All resolves counted. Source: alert_user_activity.',
+    recClicks: 'RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System bug: these are written as UNDO in the DB but actually mean the user clicked the co-pilot recommendation button. Source: alert_user_activity.',
+    opensFired: 'Opens ÷ Fired × 100%. Directional metric — mixes both data sources. Not shown at user level. Source: alert_overview + alert_user_activity.',
+  };
+
+  const [tipState, setTipState] = useState(null); // { x, y, text }
+
+  const thProps = (key, right) => ({
+    className: thCls + (right ? ' text-right' : ''),
+    onClick: () => sortBy(key),
+    onMouseEnter: (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      setTipState({ x: r.left + r.width / 2, y: r.bottom, text: COL_TIPS[key] });
+    },
+    onMouseLeave: () => setTipState(null),
+  });
 
   const funnelItems = merged ? [
     { label: 'Fired',       count: kpis.fired,     color: '#6b7280' },
@@ -3581,26 +3608,53 @@ function AdoptionScreen() {
               <table className="w-full text-sm">
                 <thead className="border-b border-gray-100 bg-gray-50">
                   <tr>
-                    <th className={thCls} onClick={() => sortBy('name')}>
+                    <th {...thProps('name', false)}>
                       {axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User'}
                       {sortIcon('name')}
                     </th>
                     {!isUser && (
-                      <th className={thCls + ' text-right'} onClick={() => sortBy('fired')}>Fired{sortIcon('fired')}</th>
+                      <th {...thProps('fired', true)}>Fired{sortIcon('fired')}</th>
                     )}
-                    <th className={thCls + ' text-right'} onClick={() => sortBy('opens')}>Opens{sortIcon('opens')}</th>
-                    <th className={thCls + ' text-right'} onClick={() => sortBy('openedBy')}>Opened by{sortIcon('openedBy')}</th>
-                    <th className={thCls + ' text-right'} onClick={() => sortBy('resolves')}>Resolves{sortIcon('resolves')}</th>
-                    <th className={thCls + ' text-right'} onClick={() => sortBy('recClicks')}>Rec. Clicks{sortIcon('recClicks')}</th>
                     {!isUser && (
-                      <th className={thCls + ' text-right'} onClick={() => sortBy('opensFired')}>Opens/Fired{sortIcon('opensFired')}</th>
+                      <th {...thProps('reachUsers', true)}>Users Reached{sortIcon('reachUsers')}</th>
+                    )}
+                    <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
+                    <th {...thProps('openedBy', true)}>Opened by{sortIcon('openedBy')}</th>
+                    <th {...thProps('resolves', true)}>Resolves{sortIcon('resolves')}</th>
+                    <th {...thProps('recClicks', true)}>Rec. Clicks{sortIcon('recClicks')}</th>
+                    {!isUser && (
+                      <th {...thProps('opensFired', true)}>Opens/Fired{sortIcon('opensFired')}</th>
                     )}
                   </tr>
                 </thead>
+
+                {/* Fixed-position tooltip — escapes overflow-x-auto clipping */}
+                {tipState && (
+                  <div style={{
+                    position: 'fixed',
+                    left: Math.max(8, Math.min(tipState.x - 120, window.innerWidth - 256)),
+                    top: tipState.y + 6,
+                    width: 240,
+                    background: '#1f2937',
+                    color: '#f3f4f6',
+                    fontSize: 11,
+                    lineHeight: 1.55,
+                    borderRadius: 6,
+                    padding: '7px 11px',
+                    zIndex: 9999,
+                    pointerEvents: 'none',
+                    fontWeight: 400,
+                    textTransform: 'none',
+                    letterSpacing: 'normal',
+                    textAlign: 'left',
+                  }}>
+                    {tipState.text}
+                  </div>
+                )}
                 <tbody className="divide-y divide-gray-100">
                   {sortedRows.length === 0 && (
                     <tr>
-                      <td colSpan={isUser ? 5 : 7} className="px-4 py-10 text-center text-sm text-gray-400">
+                      <td colSpan={isUser ? 5 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
                         No data for the selected filters and date range.
                       </td>
                     </tr>
@@ -3622,6 +3676,11 @@ function AdoptionScreen() {
                       {!isUser && (
                         <td className={tdCls + ' text-right tabular-nums text-gray-700'}>
                           {row.fired != null ? row.fired.toLocaleString() : '—'}
+                        </td>
+                      )}
+                      {!isUser && (
+                        <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
+                          {row.reachUsers != null ? row.reachUsers.toLocaleString() : '—'}
                         </td>
                       )}
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.opens.toLocaleString()}</td>
@@ -3658,6 +3717,7 @@ function AdoptionScreen() {
                 <p className="font-semibold text-gray-800 mb-1">Metric definitions</p>
                 <ul className="space-y-1 text-xs list-disc list-inside">
                   <li><strong>Fired:</strong> Deduped signal instances from Source 1. Never shown at user level.</li>
+                  <li><strong>Users Reached:</strong> Distinct users who viewed the alerts list (GET_ALL_ALERTS/FETCH) for that tenant or facility. Shows who has visibility of the page, not necessarily engagement. Not available at signal or user level.</li>
                   <li><strong>Opens:</strong> Every <code className="bg-gray-100 px-0.5 rounded">activityType=ANALYSIS, action=CLICKED</code> event. Each click = +1.</li>
                   <li><strong>Opened by:</strong> Count of distinct user emails with at least one Open.</li>
                   <li><strong>Resolves:</strong> All <code className="bg-gray-100 px-0.5 rounded">activityType=RECOMMENDATION, action=RESOLVE</code> events.</li>

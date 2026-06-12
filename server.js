@@ -1364,6 +1364,7 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
       { activityType: 'RECOMMENDATION', action: 'RESOLVE' },
       { activityType: 'RECOMMENDATION', action: 'UNDO',
         'key_data.coPilotRecommendationClicked': true },
+      { activityType: 'GET_ALL_ALERTS', action: 'FETCH' },
     ],
   };
   if (excludedUsers.length > 0) baseMatch.userEmail = { $nin: excludedUsers };
@@ -1387,6 +1388,7 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
       stage: { $switch: {
         branches: [
           { case: { $and: [{ $eq: ['$activityType', 'ANALYSIS'] },       { $eq: ['$action', 'CLICKED'] }] }, then: 1 },
+          { case: { $and: [{ $eq: ['$activityType', 'GET_ALL_ALERTS'] }, { $eq: ['$action', 'FETCH']   }] }, then: 2 },
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'RESOLVE'] }] }, then: 3 },
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'UNDO']    }] }, then: 4 },
         ],
