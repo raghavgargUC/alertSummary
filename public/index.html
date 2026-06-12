@@ -1931,12 +1931,28 @@ function SignalDetailScreen({ signal, onBack, onSelectCustomer }) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /** Headline number tile used by Impact + Customer drilldowns. */
-function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200' }) {
+function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200', tip }) {
+  const [tipPos, setTipPos] = React.useState(null);
   return (
-    <div className={`rounded-xl border ${tone} px-4 py-3 shadow-sm`}>
-      <p className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold leading-none">{label}</p>
+    <div
+      className={`rounded-xl border ${tone} px-4 py-3 shadow-sm relative`}
+      onMouseEnter={tip ? (e) => { const r = e.currentTarget.getBoundingClientRect(); setTipPos({ x: r.left + r.width / 2, y: r.bottom + 6 }); } : undefined}
+      onMouseLeave={tip ? () => setTipPos(null) : undefined}
+    >
+      <p className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold leading-none flex items-center gap-1">
+        {label}
+        {tip && <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-gray-200 text-gray-500 text-[9px] font-bold leading-none cursor-default select-none">?</span>}
+      </p>
       <p className="text-3xl font-black tabular-nums tracking-tight mt-2" style={{ color: accent }}>{value}</p>
       {sub && <p className="text-xs text-gray-400 mt-1 leading-snug">{sub}</p>}
+      {tip && tipPos && ReactDOM.createPortal(
+        <div style={{ position: 'fixed', left: tipPos.x, top: tipPos.y, transform: 'translateX(-50%)', zIndex: 9999, maxWidth: 280, pointerEvents: 'none' }}
+          className="bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl leading-relaxed">
+          {tip}
+          <div style={{ position: 'absolute', top: -5, left: '50%', transform: 'translateX(-50%)', width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderBottom: '5px solid #111827' }} />
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
@@ -3130,19 +3146,21 @@ function applyAdoptionChips(rows, chips, merged, hasUserDim) {
 
 function computeAdoptionKPIs(filtFired, filtAct) {
   let fired = 0, opens = 0, resolves = 0, recClicks = 0;
-  const openUserSet = new Set();
-  const engUserSet  = new Set();
+  const openUserSet  = new Set();
+  const engUserSet   = new Set();
+  const reachUserSet = new Set();
 
   for (const r of filtFired) fired += r[4];
   for (const r of filtAct) {
     const [,,,, stage, uIdx, cnt] = r;
     if (stage === 1) { opens += cnt;     if (uIdx >= 0) openUserSet.add(uIdx); }
+    if (stage === 2) {                   if (uIdx >= 0) reachUserSet.add(uIdx); }
     if (stage === 3)   resolves  += cnt;
     if (stage === 4)   recClicks += cnt;
     if (uIdx >= 0)     engUserSet.add(uIdx);
   }
 
-  return { fired, opens, openedBy: openUserSet.size, resolves, recClicks, engagedUsers: engUserSet.size };
+  return { fired, opens, openedBy: openUserSet.size, resolves, recClicks, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
 }
 
 function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
@@ -3509,14 +3527,21 @@ function AdoptionScreen() {
       {!loading && !error && merged && (
         <>
           {/* ── KPI cards ───────────────────────────────────────────────── */}
-          <div className="grid grid-cols-5 gap-3">
-            <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}        accent="#374151" />
-            <KpiTile label="Opens"          value={kpis.opens.toLocaleString()}        sub={`by ${kpis.openedBy} users`}         accent="#2563eb" />
-            <KpiTile label="Resolves"       value={kpis.resolves.toLocaleString()}     accent="#059669" />
-            <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}    sub="co-pilot button tapped"               accent="#d97706" />
+          <div className="grid grid-cols-6 gap-3">
+            <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}        accent="#374151"
+              tip="Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt." />
+            <KpiTile label="Users Reached"  value={kpis.reachUsers.toLocaleString()}   sub="viewed alerts list"  accent="#0891b2"
+              tip="Distinct users who opened the alerts list page at least once (GET_ALL_ALERTS / FETCH events). Measures visibility, not engagement. Source: alert_user_activity." />
+            <KpiTile label="Opens"          value={kpis.opens.toLocaleString()}        sub={`by ${kpis.openedBy} users`} accent="#2563eb"
+              tip="Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). 'by N users' = distinct user emails with at least one open. Source: alert_user_activity." />
+            <KpiTile label="Resolves"       value={kpis.resolves.toLocaleString()}     accent="#059669"
+              tip="Count of RECOMMENDATION + RESOLVE events. All resolves are counted regardless of which recommendation was acted on. Source: alert_user_activity." />
+            <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}    sub="co-pilot button tapped" accent="#d97706"
+              tip="RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System quirk: these are written as UNDO in the DB but actually mean the user tapped the co-pilot recommendation button. Source: alert_user_activity." />
             <div className="cursor-pointer" onClick={() => { setAxis('user'); setSortKey('opens'); setSortDir('desc'); }}>
               <KpiTile label="Engaged Users" value={kpis.engagedUsers.toLocaleString()} sub="click to view by user"
-                accent="#7c3aed" tone="bg-violet-50 border-violet-200" />
+                accent="#7c3aed" tone="bg-violet-50 border-violet-200"
+                tip="Distinct users with any Open or qualifying Resolve in the current filter window. Click this card to jump to the User axis in the explorer below. Source: alert_user_activity." />
             </div>
           </div>
 
