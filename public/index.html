@@ -153,7 +153,7 @@ async function apiFetch(url) {
 // any path without server cooperation. App reads on mount, writes on state
 // change, and listens to `hashchange` + `popstate` for back/forward.
 
-const VALID_TABS = ['impact', 'customers', 'issues', 'subscriptions', 'feedbacks'];
+const VALID_TABS = ['impact', 'customers', 'issues', 'subscriptions', 'feedbacks', 'adoption'];
 const VALID_SUB_VIEWS = ['overview', 'list', 'matrix'];
 
 /** Parse the current location.hash into `{ tab, detail }`. Falls back to `impact`. */
@@ -1931,12 +1931,28 @@ function SignalDetailScreen({ signal, onBack, onSelectCustomer }) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /** Headline number tile used by Impact + Customer drilldowns. */
-function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200' }) {
+function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200', tip }) {
+  const [tipPos, setTipPos] = React.useState(null);
   return (
-    <div className={`rounded-xl border ${tone} px-4 py-3 shadow-sm`}>
-      <p className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold leading-none">{label}</p>
+    <div
+      className={`rounded-xl border ${tone} px-4 py-3 shadow-sm relative`}
+      onMouseEnter={tip ? (e) => { const r = e.currentTarget.getBoundingClientRect(); setTipPos({ x: r.left + r.width / 2, y: r.bottom + 6 }); } : undefined}
+      onMouseLeave={tip ? () => setTipPos(null) : undefined}
+    >
+      <p className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold leading-none flex items-center gap-1">
+        {label}
+        {tip && <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-gray-200 text-gray-500 text-[9px] font-bold leading-none cursor-default select-none">?</span>}
+      </p>
       <p className="text-3xl font-black tabular-nums tracking-tight mt-2" style={{ color: accent }}>{value}</p>
       {sub && <p className="text-xs text-gray-400 mt-1 leading-snug">{sub}</p>}
+      {tip && tipPos && ReactDOM.createPortal(
+        <div style={{ position: 'fixed', left: tipPos.x, top: tipPos.y, transform: 'translateX(-50%)', zIndex: 9999, maxWidth: 280, pointerEvents: 'none' }}
+          className="bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl leading-relaxed">
+          {tip}
+          <div style={{ position: 'absolute', top: -5, left: '50%', transform: 'translateX(-50%)', width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderBottom: '5px solid #111827' }} />
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
@@ -3053,7 +3069,706 @@ function FeedbacksScreen() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 10. App root — tab router, URL sync, drilldown resolution
+// 10. Adoption tab — Co-pilot signal engagement
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── Pure helpers (outside component for stable references) ──────────────────
+
+function todayIST() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+/**
+ * Merge dimension arrays from the /fired and /activity endpoints into
+ * unified master arrays with remapped indices so both row sets use the
+ * same index space.
+ */
+function mergeAdoptionData(fr, ar) {
+  const tSet = new Set([...fr.tenants, ...ar.tenants]);
+  const fSet = new Set([...fr.facilities, ...ar.facilities]);
+
+  const sigById = new Map();
+  (fr.signals || []).forEach((s) => { if (s?.id) sigById.set(s.id, s); });
+  (ar.signals || []).forEach((s) => { if (s?.id && !sigById.has(s.id)) sigById.set(s.id, s); });
+
+  const tenants    = [...tSet].sort();
+  const facilities = [...fSet].sort();
+  const signals    = [...sigById.values()];
+  const users      = [...(ar.users || [])].sort();
+
+  const tMap = new Map(tenants.map((t, i) => [t, i]));
+  const fMap = new Map(facilities.map((f, i) => [f, i]));
+  const sMap = new Map(signals.map((s, i) => [s.id, i]));
+  const uMap = new Map(users.map((u, i) => [u, i]));
+
+  const firedRows = (fr.rows || []).map((r) => {
+    const t = fr.tenants[r[0]];
+    const f = fr.facilities[r[1]];
+    const s = fr.signals[r[2]];
+    return [
+      tMap.has(t) ? tMap.get(t) : -1,
+      fMap.has(f) ? fMap.get(f) : -1,
+      s && sMap.has(s.id) ? sMap.get(s.id) : -1,
+      r[3], r[4],
+    ];
+  });
+
+  const actRows = (ar.rows || []).map((r) => {
+    const t = ar.tenants[r[0]];
+    const f = ar.facilities[r[1]];
+    const s = ar.signals[r[2]];
+    const u = ar.users?.[r[5]];
+    return [
+      tMap.has(t) ? tMap.get(t) : -1,
+      fMap.has(f) ? fMap.get(f) : -1,
+      s && sMap.has(s.id) ? sMap.get(s.id) : -1,
+      r[3], r[4],
+      u && uMap.has(u) ? uMap.get(u) : -1,
+      r[6],
+    ];
+  });
+
+  return { tenants, facilities, signals, users, firedRows, actRows, tMap, fMap, sMap, uMap };
+}
+
+function applyAdoptionChips(rows, chips, merged, hasUserDim) {
+  if (!chips.length) return rows;
+  return rows.filter((row) => {
+    for (const chip of chips) {
+      if (chip.axis === 'tenant'   && row[0] !== (merged.tMap.get(chip.value) ?? -99)) return false;
+      if (chip.axis === 'facility' && row[1] !== (merged.fMap.get(chip.value) ?? -99)) return false;
+      if (chip.axis === 'signal'   && row[2] !== (merged.sMap.get(chip.value) ?? -99)) return false;
+      if (chip.axis === 'user' && hasUserDim && row[5] !== (merged.uMap.get(chip.value) ?? -99)) return false;
+    }
+    return true;
+  });
+}
+
+function computeAdoptionKPIs(filtFired, filtAct) {
+  let fired = 0, opens = 0, resolves = 0, recClicks = 0;
+  const openUserSet  = new Set();
+  const engUserSet   = new Set();
+  const reachUserSet = new Set();
+
+  for (const r of filtFired) fired += r[4];
+  for (const r of filtAct) {
+    const [,,,, stage, uIdx, cnt] = r;
+    if (stage === 1) { opens += cnt;     if (uIdx >= 0) openUserSet.add(uIdx); }
+    if (stage === 2) {                   if (uIdx >= 0) reachUserSet.add(uIdx); }
+    if (stage === 3)   resolves  += cnt;
+    if (stage === 4)   recClicks += cnt;
+    if (uIdx >= 0)     engUserSet.add(uIdx);
+  }
+
+  return { fired, opens, openedBy: openUserSet.size, resolves, recClicks, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
+}
+
+function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
+  if (!merged) return [];
+  const grouped = new Map(); // key → bucket
+
+  const ensure = (key) => {
+    if (!grouped.has(key)) grouped.set(key, { fired: 0, opens: 0, openUsers: new Set(), resolves: 0, recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
+    return grouped.get(key);
+  };
+
+  if (axis === 'user') {
+    for (const r of filtAct) {
+      const uIdx = r[5];
+      if (uIdx < 0) continue;
+      const g = ensure(uIdx);
+      const stage = r[4], cnt = r[6];
+      if (stage === 1) { g.opens += cnt; g.openUsers.add(uIdx); }
+      if (stage === 3) g.resolves  += cnt;
+      if (stage === 4) g.recClicks += cnt;
+    }
+    return [...grouped.entries()].map(([idx, g]) => ({
+      key: idx, name: merged.users[idx] || '?', label: merged.users[idx] || '?',
+      fired: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
+      resolves: g.resolves, recClicks: g.recClicks, opensFired: null,
+    }));
+  }
+
+  const dim = axis === 'tenant' ? 0 : axis === 'facility' ? 1 : 2;
+
+  for (const r of filtFired) {
+    const key = r[dim];
+    if (key < 0) continue;
+    const g = ensure(key);
+    g.fired += r[4];
+    if (axis === 'facility') g.parentTenants.add(r[0]);
+  }
+
+  for (const r of filtAct) {
+    const key = r[dim];
+    if (key < 0) continue;
+    const g = ensure(key);
+    const stage = r[4], cnt = r[6];
+    if (stage === 1) { g.opens += cnt; if (r[5] >= 0) g.openUsers.add(r[5]); }
+    if (stage === 2) { if (r[5] >= 0) g.reachUsers.add(r[5]); }
+    if (stage === 3) g.resolves  += cnt;
+    if (stage === 4) g.recClicks += cnt;
+    if (axis === 'facility') g.parentTenants.add(r[0]);
+  }
+
+  const nameArr = axis === 'tenant'   ? merged.tenants
+    : axis === 'facility' ? merged.facilities
+    : merged.signals.map((s) => s.name);
+
+  return [...grouped.entries()].map(([idx, g]) => {
+    const rawName = nameArr[idx] || '?';
+    let label = rawName;
+    if (axis === 'facility' && g.parentTenants.size > 0) {
+      const tenantNames = [...g.parentTenants]
+        .map((ti) => merged.tenants[ti] || '?')
+        .join(', ');
+      label = `${rawName} · ${tenantNames}`;
+    }
+    const opensFired = g.fired > 0 ? parseFloat(((g.opens / g.fired) * 100).toFixed(1)) : null;
+    // reachUsers only meaningful at tenant/facility level; signal has no FETCH attribution
+    const reachUsers = axis === 'signal' ? null : g.reachUsers.size;
+    return {
+      key: idx, name: rawName, label,
+      fired: g.fired, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
+      resolves: g.resolves, recClicks: g.recClicks, opensFired,
+    };
+  });
+}
+
+function computeAdoptionTrendData(filtFired, filtAct) {
+  const byDate = new Map();
+  const ensure = (d) => {
+    if (!byDate.has(d)) byDate.set(d, { fired: 0, opens: 0, resolves: 0, recClicks: 0 });
+    return byDate.get(d);
+  };
+  for (const r of filtFired) ensure(r[3]).fired += r[4];
+  for (const r of filtAct) {
+    const b = ensure(r[3]);
+    if (r[4] === 1) b.opens     += r[6];
+    if (r[4] === 3) b.resolves  += r[6];
+    if (r[4] === 4) b.recClicks += r[6];
+  }
+  const dates = [...byDate.keys()].sort();
+  return {
+    labels:    dates,
+    fired:     dates.map((d) => byDate.get(d).fired),
+    opens:     dates.map((d) => byDate.get(d).opens),
+    resolves:  dates.map((d) => byDate.get(d).resolves),
+    recClicks: dates.map((d) => byDate.get(d).recClicks),
+  };
+}
+
+// ── Sub-components ──────────────────────────────────────────────────────────
+
+function AdoptionTrendChart({ trendData }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    const chart = new Chart(canvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: trendData.labels,
+        datasets: [
+          { type: 'bar',  label: 'Fired',       data: trendData.fired,     backgroundColor: 'rgba(107,114,128,0.2)', borderColor: '#9ca3af', borderWidth: 1, borderRadius: 2, yAxisID: 'y',  order: 2 },
+          { type: 'line', label: 'Opens',        data: trendData.opens,     borderColor: '#3b82f6', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
+          { type: 'line', label: 'Resolves',     data: trendData.resolves,  borderColor: '#10b981', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
+          { type: 'line', label: 'Rec. Clicks',  data: trendData.recClicks, borderColor: '#f59e0b', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 10 } } } },
+        scales: {
+          x:  { ticks: { font: { size: 10 } }, grid: { display: false } },
+          y:  { type: 'linear', position: 'left',  beginAtZero: true, title: { display: true, text: 'Fired', font: { size: 9 } }, grid: { color: '#f3f4f6' } },
+          y1: { type: 'linear', position: 'right', beginAtZero: true, title: { display: true, text: 'Opens / Resolves / Clicks', font: { size: 9 } }, grid: { drawOnChartArea: false } },
+        },
+      },
+    });
+    return () => chart.destroy();
+  }, [trendData]);
+  return <div style={{ height: 220 }}><canvas ref={canvasRef} /></div>;
+}
+
+// ── Main AdoptionScreen ──────────────────────────────────────────────────────
+
+function AdoptionScreen() {
+  const [dateFrom, setDateFrom] = useState('2026-06-01');
+  const [dateTo,   setDateTo]   = useState(todayIST);
+  const [chips,    setChips]    = useState([]);    // [{axis, value, label}]
+  const [axis,     setAxis]     = useState('tenant');
+  const [sortKey,  setSortKey]  = useState('fired');
+  const [sortDir,  setSortDir]  = useState('desc');
+  const [excludedUsers, setExcludedUsers] = useState(['techsupport@unicommerce.com']);
+  const [newExclUser,   setNewExclUser]   = useState('');
+  const [firedData, setFiredData] = useState(null);
+  const [actData,   setActData]   = useState(null);
+  const [loading,   setLoading]   = useState(true);
+  const [error,     setError]     = useState(null);
+  const [retryCount, setRetryCount] = useState(0);
+
+  // ── Fetch both endpoints whenever filters change ─────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const params = new URLSearchParams({ from: dateFrom, to: dateTo });
+    if (excludedUsers.length) params.set('excludedUsers', excludedUsers.join(','));
+    Promise.all([
+      apiFetch(`/api/adoption/fired?${params}`),
+      apiFetch(`/api/adoption/activity?${params}`),
+    ]).then(([fd, ad]) => {
+      if (!cancelled) { setFiredData(fd); setActData(ad); setLoading(false); }
+    }).catch((e) => {
+      if (!cancelled) { setError(e.message); setLoading(false); }
+    });
+    return () => { cancelled = true; };
+  }, [dateFrom, dateTo, excludedUsers, retryCount]);
+
+  // ── Client-side pivot ────────────────────────────────────────────────────
+  const merged = useMemo(() => {
+    if (!firedData || !actData) return null;
+    return mergeAdoptionData(firedData, actData);
+  }, [firedData, actData]);
+
+  const filtFired = useMemo(
+    () => merged ? applyAdoptionChips(merged.firedRows, chips, merged, false) : [],
+    [merged, chips]
+  );
+  const filtAct = useMemo(
+    () => merged ? applyAdoptionChips(merged.actRows, chips, merged, true) : [],
+    [merged, chips]
+  );
+
+  const kpis         = useMemo(() => computeAdoptionKPIs(filtFired, filtAct),                             [filtFired, filtAct]);
+  const explorerRows = useMemo(() => merged ? computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) : [], [axis, filtFired, filtAct, merged]);
+  const trendData    = useMemo(() => computeAdoptionTrendData(filtFired, filtAct),                        [filtFired, filtAct]);
+
+  const sortedRows = useMemo(() => {
+    const rows = [...explorerRows];
+    rows.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      if (av === null && bv === null) return 0;
+      if (av === null) return sortDir === 'asc' ? -1 : 1;
+      if (bv === null) return sortDir === 'asc' ? 1 : -1;
+      if (typeof av === 'number' && typeof bv === 'number')
+        return sortDir === 'asc' ? av - bv : bv - av;
+      return sortDir === 'asc'
+        ? String(av).localeCompare(String(bv))
+        : String(bv).localeCompare(String(av));
+    });
+    return rows;
+  }, [explorerRows, sortKey, sortDir]);
+
+  // ── Handlers ─────────────────────────────────────────────────────────────
+  const addChip = useCallback((chipAxis, value, label) => {
+    setChips((prev) => {
+      if (prev.some((c) => c.axis === chipAxis && c.value === value)) return prev;
+      return [...prev, { axis: chipAxis, value, label: label || value }];
+    });
+    const order = ['tenant', 'facility', 'signal', 'user'];
+    const ni = order.indexOf(chipAxis) + 1;
+    if (ni < order.length) setAxis(order[ni]);
+  }, []);
+
+  const removeChip = useCallback((i) => setChips((prev) => prev.filter((_, j) => j !== i)), []);
+
+  const sortBy = (key) => {
+    if (sortKey === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir('desc'); }
+  };
+
+  const applyPreset = (p) => {
+    const today = todayIST();
+    if (p === 'launch') {
+      setDateFrom('2026-06-01'); setDateTo(today);
+    } else if (p === '7d') {
+      const d = new Date(); d.setDate(d.getDate() - 7);
+      setDateFrom(d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }));
+      setDateTo(today);
+    } else if (p === 'yesterday') {
+      const d = new Date(); d.setDate(d.getDate() - 1);
+      const y = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      setDateFrom(y); setDateTo(y);
+    }
+    setChips([]); setAxis('tenant');
+  };
+
+  const addExclUser = () => {
+    const u = newExclUser.trim();
+    if (u && !excludedUsers.includes(u)) setExcludedUsers((prev) => [...prev, u]);
+    setNewExclUser('');
+  };
+
+  const downloadCsv = () => {
+    if (!sortedRows.length || !merged) return;
+    const isUser = axis === 'user';
+    const headers = [
+      axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
+      ...(isUser ? [] : ['Fired', 'Users Reached']),
+      'Opens', 'Opened by', 'Resolves', 'Rec. Clicks',
+      ...(isUser ? [] : ['Opens/Fired %']),
+    ];
+    const dataRows = sortedRows.map((r) => [
+      `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
+      ...(isUser ? [] : [r.fired ?? '', r.reachUsers ?? '']),
+      r.opens, r.openedBy, r.resolves, r.recClicks,
+      ...(isUser ? [] : [r.opensFired != null ? r.opensFired.toFixed(1) : '']),
+    ].join(','));
+    const csv   = [headers.join(','), ...dataRows].join('\r\n');
+    const blob  = new Blob([csv], { type: 'text/csv' });
+    const url   = URL.createObjectURL(blob);
+    const link  = document.createElement('a');
+    link.href = url;
+    link.download = `adoption-${axis}-${dateFrom}-${dateTo}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const today           = todayIST();
+  const showStaleBanner = firedData?.coverageThrough && firedData.coverageThrough < today;
+  const isUser          = axis === 'user';
+  const sortIcon        = (key) => sortKey !== key ? ' ↕' : sortDir === 'asc' ? ' ↑' : ' ↓';
+
+  const thCls = 'px-3 py-2 text-left text-[11px] uppercase tracking-wide font-semibold text-gray-500 cursor-pointer select-none hover:text-gray-700 whitespace-nowrap';
+  const tdCls = 'px-3 py-2.5 text-sm';
+
+  // Column definitions shown on header hover
+  const COL_TIPS = {
+    name: 'Click any row name to add it as a filter chip and drill deeper. Chips combine freely across Tenant → Facility → Signal → User.',
+    fired: 'Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt. Not shown at user level — firing has no user attribution.',
+    reachUsers: 'Distinct users who viewed the alerts list (GET_ALL_ALERTS / FETCH events) for this tenant or facility. Shows who has visibility of the alerts page, regardless of whether they opened any specific alert. Not available at signal or user level.',
+    opens: 'Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). Source: alert_user_activity.',
+    openedBy: 'Distinct user emails with at least one Open in this slice. Source: alert_user_activity.',
+    resolves: 'Count of RECOMMENDATION + RESOLVE events. All resolves counted. Source: alert_user_activity.',
+    recClicks: 'RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System bug: these are written as UNDO in the DB but actually mean the user clicked the co-pilot recommendation button. Source: alert_user_activity.',
+    opensFired: 'Opens ÷ Fired × 100%. Directional metric — mixes both data sources. Not shown at user level. Source: alert_overview + alert_user_activity.',
+  };
+
+  const [tipState, setTipState] = useState(null); // { x, y, text }
+
+  const thProps = (key, right) => ({
+    className: thCls + (right ? ' text-right' : ''),
+    onClick: () => sortBy(key),
+    onMouseEnter: (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      setTipState({ x: r.left + r.width / 2, y: r.bottom, text: COL_TIPS[key] });
+    },
+    onMouseLeave: () => setTipState(null),
+  });
+
+  const funnelItems = merged ? [
+    { label: 'Fired',       count: kpis.fired,     color: '#6b7280' },
+    { label: 'Opened',      count: kpis.opens,     color: '#3b82f6' },
+    { label: 'Resolved',    count: kpis.resolves,  color: '#10b981' },
+    { label: 'Rec. Clicked', count: kpis.recClicks, color: '#f59e0b' },
+  ] : [];
+
+  return (
+    <div className="fade-in space-y-4">
+
+      {/* Staleness banner */}
+      {showStaleBanner && (
+        <div className="rounded-lg bg-amber-50 border border-amber-200 px-4 py-2 text-sm text-amber-800">
+          Fired data through <strong>{firedData.coverageThrough}</strong> — today's firing data may not be available yet.
+        </div>
+      )}
+
+      {/* ── Filter bar ────────────────────────────────────────────────── */}
+      <div className="bg-white rounded-xl border border-gray-200 p-4 space-y-3">
+        {/* Date range + presets */}
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs text-gray-500">From</label>
+            <input type="date" value={dateFrom} max={dateTo}
+              onChange={(e) => { setDateFrom(e.target.value); setChips([]); setAxis('tenant'); }}
+              className="border border-gray-200 rounded px-2 py-1 text-sm" />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs text-gray-500">To</label>
+            <input type="date" value={dateTo} min={dateFrom}
+              onChange={(e) => { setDateTo(e.target.value); setChips([]); setAxis('tenant'); }}
+              className="border border-gray-200 rounded px-2 py-1 text-sm" />
+          </div>
+          <div className="h-4 border-l border-gray-200" />
+          {[['launch', 'Since launch'], ['7d', 'Last 7d'], ['yesterday', 'Yesterday']].map(([p, lbl]) => (
+            <button key={p} onClick={() => applyPreset(p)}
+              className="px-2.5 py-1 text-xs rounded border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors">
+              {lbl}
+            </button>
+          ))}
+        </div>
+        {/* Excluded users */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs text-gray-400 shrink-0">Excluded users:</span>
+          {excludedUsers.map((u) => (
+            <span key={u} className="inline-flex items-center gap-1 px-2 py-0.5 bg-gray-100 rounded-full text-xs text-gray-600">
+              {u}
+              <button onClick={() => setExcludedUsers((prev) => prev.filter((e) => e !== u))}
+                className="text-gray-400 hover:text-gray-700 ml-0.5 leading-none">×</button>
+            </span>
+          ))}
+          <input type="text" value={newExclUser}
+            onChange={(e) => setNewExclUser(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') addExclUser(); }}
+            placeholder="+ add email to exclude"
+            className="border border-dashed border-gray-300 rounded px-2 py-0.5 text-xs w-44 text-gray-600 placeholder-gray-300 focus:outline-none focus:border-gray-400" />
+          {newExclUser.trim() && (
+            <button onClick={addExclUser}
+              className="text-xs px-2 py-0.5 bg-gray-800 text-white rounded hover:bg-gray-700">Add</button>
+          )}
+        </div>
+      </div>
+
+      {error && <ErrorBox msg={error} onRetry={() => setRetryCount((n) => n + 1)} />}
+      {loading && <div className="py-16 flex justify-center"><Spinner /></div>}
+
+      {!loading && !error && merged && (
+        <>
+          {/* ── KPI cards ───────────────────────────────────────────────── */}
+          <div className="grid grid-cols-6 gap-3">
+            <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}        accent="#374151"
+              tip="Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt." />
+            <KpiTile label="Users Reached"  value={kpis.reachUsers.toLocaleString()}   sub="viewed alerts list"  accent="#0891b2"
+              tip="Distinct users who opened the alerts list page at least once (GET_ALL_ALERTS / FETCH events). Measures visibility, not engagement. Source: alert_user_activity." />
+            <KpiTile label="Opens"          value={kpis.opens.toLocaleString()}        sub={`by ${kpis.openedBy} users`} accent="#2563eb"
+              tip="Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). 'by N users' = distinct user emails with at least one open. Source: alert_user_activity." />
+            <KpiTile label="Resolves"       value={kpis.resolves.toLocaleString()}     accent="#059669"
+              tip="Count of RECOMMENDATION + RESOLVE events. All resolves are counted regardless of which recommendation was acted on. Source: alert_user_activity." />
+            <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}    sub="co-pilot button tapped" accent="#d97706"
+              tip="RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System quirk: these are written as UNDO in the DB but actually mean the user tapped the co-pilot recommendation button. Source: alert_user_activity." />
+            <div className="cursor-pointer" onClick={() => { setAxis('user'); setSortKey('opens'); setSortDir('desc'); }}>
+              <KpiTile label="Engaged Users" value={kpis.engagedUsers.toLocaleString()} sub="click to view by user"
+                accent="#7c3aed" tone="bg-violet-50 border-violet-200"
+                tip="Distinct users with any Open or qualifying Resolve in the current filter window. Click this card to jump to the User axis in the explorer below. Source: alert_user_activity." />
+            </div>
+          </div>
+
+          {/* ── Funnel + Trend ───────────────────────────────────────────── */}
+          <div className="grid grid-cols-2 gap-4">
+            {/* Funnel */}
+            <div className="bg-white rounded-xl border border-gray-200 p-4">
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Engagement funnel (log scale)</p>
+              <div className="space-y-3">
+                {funnelItems.map(({ label, count, color }) => {
+                  const pct = kpis.fired > 0 && count > 0
+                    ? Math.max(3, Math.round((Math.log(count + 1) / Math.log(kpis.fired + 1)) * 100))
+                    : 0;
+                  return (
+                    <div key={label}>
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs text-gray-600">{label}</span>
+                        <span className="text-xs font-semibold tabular-nums" style={{ color }}>{count.toLocaleString()}</span>
+                      </div>
+                      <div className="h-5 rounded bg-gray-100 overflow-hidden">
+                        <div className="h-5 rounded transition-all duration-300"
+                          style={{ width: pct + '%', backgroundColor: color + '28', borderLeft: `3px solid ${color}` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-gray-400 mt-3">
+                Opens/Fired: {kpis.fired > 0 ? ((kpis.opens / kpis.fired) * 100).toFixed(1) + '%' : '—'}
+                {' · '}Opened by {kpis.openedBy} distinct users
+              </p>
+            </div>
+
+            {/* Trend chart */}
+            <div className="bg-white rounded-xl border border-gray-200 p-4">
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Daily trend (IST)</p>
+              {trendData.labels.length > 0
+                ? <AdoptionTrendChart key={trendData.labels.join('|')} trendData={trendData} />
+                : <p className="text-sm text-gray-400 py-8 text-center">No data for selected window</p>
+              }
+            </div>
+          </div>
+
+          {/* ── Drill-down explorer ──────────────────────────────────────── */}
+          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+            {/* Explorer header */}
+            <div className="px-4 pt-4 border-b border-gray-100">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-bold text-gray-800">Drill-down explorer</h3>
+                <button onClick={downloadCsv}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                  <svg width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 16 16">
+                    <path d="M8 2v9M4 7l4 4 4-4M2 13h12" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                  Export CSV
+                </button>
+              </div>
+              {/* Axis tabs */}
+              <div className="flex gap-1 mb-2">
+                {['tenant', 'facility', 'signal', 'user'].map((a) => (
+                  <button key={a} onClick={() => setAxis(a)}
+                    className={`px-3 py-1 text-xs font-semibold rounded-t capitalize transition-colors ${
+                      axis === a ? 'bg-gray-900 text-white' : 'text-gray-500 hover:bg-gray-100'
+                    }`}>
+                    {a.charAt(0).toUpperCase() + a.slice(1)}
+                  </button>
+                ))}
+              </div>
+              {/* Active filter chips */}
+              {chips.length > 0 && (
+                <div className="flex items-center gap-2 flex-wrap pb-3">
+                  <span className="text-xs text-gray-400">Filters:</span>
+                  {chips.map((chip, i) => (
+                    <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-50 border border-blue-200 rounded-full text-xs text-blue-700">
+                      <span className="text-blue-400 text-[10px] uppercase font-medium">{chip.axis}</span>
+                      <span className="text-blue-300">·</span>
+                      <span className="font-medium">{chip.label}</span>
+                      <button onClick={() => removeChip(i)} className="text-blue-400 hover:text-blue-700 ml-0.5 leading-none">×</button>
+                    </span>
+                  ))}
+                  <button onClick={() => { setChips([]); setAxis('tenant'); }}
+                    className="text-xs text-gray-400 hover:text-gray-700 underline underline-offset-2">Clear all</button>
+                </div>
+              )}
+            </div>
+
+            {/* Table */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="border-b border-gray-100 bg-gray-50">
+                  <tr>
+                    <th {...thProps('name', false)}>
+                      {axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User'}
+                      {sortIcon('name')}
+                    </th>
+                    {!isUser && (
+                      <th {...thProps('fired', true)}>Fired{sortIcon('fired')}</th>
+                    )}
+                    {!isUser && (
+                      <th {...thProps('reachUsers', true)}>Users Reached{sortIcon('reachUsers')}</th>
+                    )}
+                    <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
+                    <th {...thProps('openedBy', true)}>Opened by{sortIcon('openedBy')}</th>
+                    <th {...thProps('resolves', true)}>Resolves{sortIcon('resolves')}</th>
+                    <th {...thProps('recClicks', true)}>Rec. Clicks{sortIcon('recClicks')}</th>
+                    {!isUser && (
+                      <th {...thProps('opensFired', true)}>Opens/Fired{sortIcon('opensFired')}</th>
+                    )}
+                  </tr>
+                </thead>
+
+                {/* Fixed-position tooltip — escapes overflow-x-auto clipping */}
+                {tipState && (
+                  <div style={{
+                    position: 'fixed',
+                    left: Math.max(8, Math.min(tipState.x - 120, window.innerWidth - 256)),
+                    top: tipState.y + 6,
+                    width: 240,
+                    background: '#1f2937',
+                    color: '#f3f4f6',
+                    fontSize: 11,
+                    lineHeight: 1.55,
+                    borderRadius: 6,
+                    padding: '7px 11px',
+                    zIndex: 9999,
+                    pointerEvents: 'none',
+                    fontWeight: 400,
+                    textTransform: 'none',
+                    letterSpacing: 'normal',
+                    textAlign: 'left',
+                  }}>
+                    {tipState.text}
+                  </div>
+                )}
+                <tbody className="divide-y divide-gray-100">
+                  {sortedRows.length === 0 && (
+                    <tr>
+                      <td colSpan={isUser ? 5 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
+                        No data for the selected filters and date range.
+                      </td>
+                    </tr>
+                  )}
+                  {sortedRows.map((row, i) => (
+                    <tr key={i} className="hover:bg-gray-50 transition-colors group">
+                      <td className={tdCls}>
+                        <button
+                          className="text-left font-mono text-xs text-blue-700 hover:underline group-hover:text-blue-800"
+                          onClick={() => {
+                            const chipVal = axis === 'signal'
+                              ? (merged.signals[row.key]?.id ?? row.name)
+                              : row.name;
+                            addChip(axis, chipVal, row.name);
+                          }}>
+                          {row.label || row.name}
+                        </button>
+                      </td>
+                      {!isUser && (
+                        <td className={tdCls + ' text-right tabular-nums text-gray-700'}>
+                          {row.fired != null ? row.fired.toLocaleString() : '—'}
+                        </td>
+                      )}
+                      {!isUser && (
+                        <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
+                          {row.reachUsers != null ? row.reachUsers.toLocaleString() : '—'}
+                        </td>
+                      )}
+                      <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.opens.toLocaleString()}</td>
+                      <td className={tdCls + ' text-right tabular-nums text-gray-500'}>{row.openedBy}</td>
+                      <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.resolves.toLocaleString()}</td>
+                      <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.recClicks.toLocaleString()}</td>
+                      {!isUser && (
+                        <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
+                          {row.opensFired != null ? row.opensFired.toFixed(1) + '%' : '—'}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* ── How every number works ───────────────────────────────────── */}
+          <details className="bg-white rounded-xl border border-gray-200">
+            <summary className="px-4 py-3 cursor-pointer text-sm text-gray-600 font-medium select-none hover:text-gray-800 list-none flex items-center gap-2">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="6" cy="6" r="5"/><path d="M6 5.5v3M6 4h.01"/>
+              </svg>
+              How every number works
+            </summary>
+            <div className="px-4 pb-4 pt-1 border-t border-gray-100 text-sm text-gray-600 space-y-4">
+              <div>
+                <p className="font-semibold text-gray-800 mb-1">Two data sources</p>
+                <p><strong>Source 1 — Fired:</strong> <code className="bg-gray-100 px-1 rounded text-xs">alert_overview.firedAt</code>. Each row = one distinct signal instance. Deduped by tenant + facility + signalId + IST date.</p>
+                <p className="mt-1"><strong>Source 2 — Activity:</strong> <code className="bg-gray-100 px-1 rounded text-xs">alert_user_activity</code>. Records every user interaction. Joined via alertId → alert_overview → signal name. <code className="bg-gray-100 px-1 rounded text-xs">GET_ALL_ALERTS</code> / background fetch events are excluded.</p>
+              </div>
+              <div>
+                <p className="font-semibold text-gray-800 mb-1">Metric definitions</p>
+                <ul className="space-y-1 text-xs list-disc list-inside">
+                  <li><strong>Fired:</strong> Deduped signal instances from Source 1. Never shown at user level.</li>
+                  <li><strong>Users Reached:</strong> Distinct users who viewed the alerts list (GET_ALL_ALERTS/FETCH) for that tenant or facility. Shows who has visibility of the page, not necessarily engagement. Not available at signal or user level.</li>
+                  <li><strong>Opens:</strong> Every <code className="bg-gray-100 px-0.5 rounded">activityType=ANALYSIS, action=CLICKED</code> event. Each click = +1.</li>
+                  <li><strong>Opened by:</strong> Count of distinct user emails with at least one Open.</li>
+                  <li><strong>Resolves:</strong> All <code className="bg-gray-100 px-0.5 rounded">activityType=RECOMMENDATION, action=RESOLVE</code> events.</li>
+                  <li><strong>Rec. Clicks:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.coPilotRecommendationClicked=true</code>. These are written as UNDO due to a system bug but actually mean the user clicked the co-pilot recommendation button.</li>
+                  <li><strong>Opens/Fired:</strong> Opens ÷ Fired × 100%. Directional (mixes both sources). Never shown at user level.</li>
+                  <li><strong>Engaged Users:</strong> Distinct users with any Open or Resolve in the slice.</li>
+                </ul>
+              </div>
+              <div>
+                <p className="font-semibold text-gray-800 mb-1">Drill-down chips</p>
+                <p className="text-xs">Click any row name to add it as a filter chip. All KPIs, charts, and the table immediately re-slice to that filter. Chips combine freely. Remove individual chips with × or use "Clear all". The axis auto-advances Tenant → Facility → Signal → User on each click.</p>
+              </div>
+              <div>
+                <p className="font-semibold text-gray-800 mb-1">Always excluded</p>
+                <p className="text-xs">Internal tenants (demostaging, recostaging) · <code className="bg-gray-100 px-0.5 rounded">GET_ALL_ALERTS</code> background fetches · UNDO events without the co-pilot flag · any emails in the "Excluded users" list above.</p>
+              </div>
+            </div>
+          </details>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. App root — tab router, URL sync, drilldown resolution
 // ═════════════════════════════════════════════════════════════════════════════
 
 const TABS = [
@@ -3062,6 +3777,7 @@ const TABS = [
   { key: 'issues',        label: 'Issues' },
   { key: 'subscriptions', label: 'Subscriptions' },
   { key: 'feedbacks',     label: 'Feedbacks' },
+  { key: 'adoption',      label: 'Adoption' },
 ];
 
 function App() {
@@ -3248,6 +3964,16 @@ function App() {
               view={subView}
               onViewChange={setSubView}
             />
+          </>
+        )}
+
+        {tab === 'adoption' && (
+          <>
+            <div className="mb-5">
+              <h1 className="text-2xl font-bold text-gray-900">Adoption</h1>
+              <p className="text-sm text-gray-500 mt-1">Co-pilot signal engagement — who opens alerts, who acts, and where adoption is zero.</p>
+            </div>
+            <AdoptionScreen />
           </>
         )}
       </main>
