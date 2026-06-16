@@ -3552,7 +3552,7 @@ function AdoptionScreen() {
       {!loading && !error && merged && (
         <>
           {/* ── KPI cards ───────────────────────────────────────────────── */}
-          <div className="grid grid-cols-6 gap-3">
+          <div className="grid grid-cols-5 gap-3">
             <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}             accent="#374151"
               tip="Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt." />
             <KpiTile label="Total Alerts"   value={kpis.totalAlerts.toLocaleString()}        accent="#6366f1"
@@ -3563,11 +3563,6 @@ function AdoptionScreen() {
               tip="Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). 'by N users' = distinct user emails with at least one open. Source: alert_user_activity." />
             <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}          sub="co-pilot button tapped" accent="#d97706"
               tip="RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System quirk: these are written as UNDO in the DB but actually mean the user tapped the co-pilot recommendation button. Source: alert_user_activity." />
-            <div className="cursor-pointer" onClick={() => { setAxis('user'); setSortKey('opens'); setSortDir('desc'); }}>
-              <KpiTile label="Engaged Users" value={kpis.engagedUsers.toLocaleString()} sub="click to view by user"
-                accent="#7c3aed" tone="bg-violet-50 border-violet-200"
-                tip="Distinct users with any Open or qualifying Resolve in the current filter window. Click this card to jump to the User axis in the explorer below. Source: alert_user_activity." />
-            </div>
           </div>
 
           {/* ── Funnel + Trend ───────────────────────────────────────────── */}
@@ -3780,7 +3775,6 @@ function AdoptionScreen() {
                   <li><strong>Opened by:</strong> Count of distinct user emails with at least one Open.</li>
                   <li><strong>Rec. Clicks:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.coPilotRecommendationClicked=true</code>. These are written as UNDO due to a system bug but actually mean the user clicked the co-pilot recommendation button.</li>
                   <li><strong>Opens/Total Alerts:</strong> Opens ÷ Total Alerts × 100%. Uses the overlap-based Total Alerts as denominator. Never shown at user level.</li>
-                  <li><strong>Engaged Users:</strong> Distinct users with any Open or Resolve in the slice.</li>
                 </ul>
               </div>
               <div>
