@@ -1296,7 +1296,7 @@ app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res
       pipeline: [
         { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$sid'] } } },
         { $limit: 1 },
-        { $project: { name: 1, signalCode: 1 } },
+        { $project: { name: 1, signalCode: 1, signalType: 1 } },
       ],
       as: '_signal',
     } },
@@ -1305,7 +1305,7 @@ app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res
   // Build dimension index arrays
   const tenantSet  = new Set();
   const facilitySet = new Set();
-  const signalMap  = new Map(); // signalId string → { id, name, signalCode }
+  const signalMap  = new Map(); // signalId string → { id, name, signalCode, signalType }
   let coverageThrough = null;
 
   for (const r of rows) {
@@ -1314,7 +1314,7 @@ app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res
     const sid = r._id.signalId;
     if (!signalMap.has(sid)) {
       const meta = r._signal?.[0] ?? {};
-      signalMap.set(sid, { id: sid, name: meta.name ?? sid, signalCode: meta.signalCode ?? null });
+      signalMap.set(sid, { id: sid, name: meta.name ?? sid, signalCode: meta.signalCode ?? null, signalType: meta.signalType ?? '' });
     }
     if (!coverageThrough || r._id.istDate > coverageThrough) coverageThrough = r._id.istDate;
   }
@@ -1369,7 +1369,7 @@ app.get('/api/adoption/total-alerts', asyncRoute('/api/adoption/total-alerts', a
       pipeline: [
         { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$sid'] } } },
         { $limit: 1 },
-        { $project: { name: 1, signalCode: 1 } },
+        { $project: { name: 1, signalCode: 1, signalType: 1 } },
       ],
       as: '_signal',
     } },
@@ -1385,7 +1385,7 @@ app.get('/api/adoption/total-alerts', asyncRoute('/api/adoption/total-alerts', a
     const sid = r._id.signalId;
     if (!signalMap.has(sid)) {
       const meta = r._signal?.[0] ?? {};
-      signalMap.set(sid, { id: sid, name: meta.name ?? sid, signalCode: meta.signalCode ?? null });
+      signalMap.set(sid, { id: sid, name: meta.name ?? sid, signalCode: meta.signalCode ?? null, signalType: meta.signalType ?? '' });
     }
   }
 
@@ -1503,7 +1503,10 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
     tenantSet.add(r._id.tenantCode);
     facilitySet.add(r._id.facilityCode);
     const sid = r._id.signalId;
-    if (sid && !signalMap.has(sid)) signalMap.set(sid, { id: sid, name: r.signalName || sid, signalType: r.signalType || '' });
+    if (sid && !signalMap.has(sid)) {
+      console.log(`[adoption/activity] signal sid=${sid} name=${r.signalName} signalType=${r.signalType}`);
+      signalMap.set(sid, { id: sid, name: r.signalName || sid, signalType: r.signalType || '' });
+    }
     if (r._id.userEmail) userSet.add(r._id.userEmail);
   }
 
