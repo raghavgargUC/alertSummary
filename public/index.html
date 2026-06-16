@@ -3235,7 +3235,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
 
   const nameArr = axis === 'tenant'   ? merged.tenants
     : axis === 'facility' ? merged.facilities
-    : merged.signals.map((s) => s.name);
+    : merged.signals.map((s) => s.signalType ? `${s.name} - ${s.signalType}` : s.name);
 
   return [...grouped.entries()].map(([idx, g]) => {
     const rawName = nameArr[idx] || '?';
