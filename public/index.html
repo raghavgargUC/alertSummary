@@ -3163,7 +3163,7 @@ function applyAdoptionChips(rows, chips, merged, hasUserDim) {
 }
 
 function computeAdoptionKPIs(filtFired, filtAct, filtTotalAlerts) {
-  let fired = 0, opens = 0, resolves = 0, recClicks = 0, totalAlerts = 0;
+  let fired = 0, opens = 0, recClicks = 0, totalAlerts = 0;
   const openUserSet  = new Set();
   const engUserSet   = new Set();
   const reachUserSet = new Set();
@@ -3174,12 +3174,11 @@ function computeAdoptionKPIs(filtFired, filtAct, filtTotalAlerts) {
     const [,,,, stage, uIdx, cnt] = r;
     if (stage === 1) { opens += cnt;     if (uIdx >= 0) openUserSet.add(uIdx); }
     if (stage === 2) {                   if (uIdx >= 0) reachUserSet.add(uIdx); }
-    if (stage === 3)   resolves  += cnt;
     if (stage === 4)   recClicks += cnt;
     if (uIdx >= 0)     engUserSet.add(uIdx);
   }
 
-  return { fired, opens, openedBy: openUserSet.size, resolves, recClicks, totalAlerts, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
+  return { fired, opens, openedBy: openUserSet.size, recClicks, totalAlerts, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
 }
 
 function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotalAlerts) {
@@ -3187,7 +3186,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
   const grouped = new Map(); // key → bucket
 
   const ensure = (key) => {
-    if (!grouped.has(key)) grouped.set(key, { fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), resolves: 0, recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
+    if (!grouped.has(key)) grouped.set(key, { fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
     return grouped.get(key);
   };
 
@@ -3198,13 +3197,12 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       const g = ensure(uIdx);
       const stage = r[4], cnt = r[6];
       if (stage === 1) { g.opens += cnt; g.openUsers.add(uIdx); }
-      if (stage === 3) g.resolves  += cnt;
       if (stage === 4) g.recClicks += cnt;
     }
     return [...grouped.entries()].map(([idx, g]) => ({
       key: idx, name: merged.users[idx] || '?', label: merged.users[idx] || '?',
       fired: null, totalAlerts: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
-      resolves: g.resolves, recClicks: g.recClicks, opensTotalAlerts: null,
+      recClicks: g.recClicks, opensTotalAlerts: null,
     }));
   }
 
@@ -3231,14 +3229,13 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
     const stage = r[4], cnt = r[6];
     if (stage === 1) { g.opens += cnt; if (r[5] >= 0) g.openUsers.add(r[5]); }
     if (stage === 2) { if (r[5] >= 0) g.reachUsers.add(r[5]); }
-    if (stage === 3) g.resolves  += cnt;
     if (stage === 4) g.recClicks += cnt;
     if (axis === 'facility') g.parentTenants.add(r[0]);
   }
 
   const nameArr = axis === 'tenant'   ? merged.tenants
     : axis === 'facility' ? merged.facilities
-    : merged.signals.map((s) => s.name);
+    : merged.signals.map((s) => s.signalType ? `${s.name} - ${s.signalType}` : s.name);
 
   return [...grouped.entries()].map(([idx, g]) => {
     const rawName = nameArr[idx] || '?';
@@ -3255,7 +3252,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
     return {
       key: idx, name: rawName, label,
       fired: g.fired, totalAlerts: g.totalAlerts, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
-      resolves: g.resolves, recClicks: g.recClicks, opensTotalAlerts,
+      recClicks: g.recClicks, opensTotalAlerts,
     };
   });
 }
@@ -3263,14 +3260,13 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
 function computeAdoptionTrendData(filtFired, filtAct) {
   const byDate = new Map();
   const ensure = (d) => {
-    if (!byDate.has(d)) byDate.set(d, { fired: 0, opens: 0, resolves: 0, recClicks: 0 });
+    if (!byDate.has(d)) byDate.set(d, { fired: 0, opens: 0, recClicks: 0 });
     return byDate.get(d);
   };
   for (const r of filtFired) ensure(r[3]).fired += r[4];
   for (const r of filtAct) {
     const b = ensure(r[3]);
     if (r[4] === 1) b.opens     += r[6];
-    if (r[4] === 3) b.resolves  += r[6];
     if (r[4] === 4) b.recClicks += r[6];
   }
   const dates = [...byDate.keys()].sort();
@@ -3278,7 +3274,6 @@ function computeAdoptionTrendData(filtFired, filtAct) {
     labels:    dates,
     fired:     dates.map((d) => byDate.get(d).fired),
     opens:     dates.map((d) => byDate.get(d).opens),
-    resolves:  dates.map((d) => byDate.get(d).resolves),
     recClicks: dates.map((d) => byDate.get(d).recClicks),
   };
 }
@@ -3296,7 +3291,6 @@ function AdoptionTrendChart({ trendData }) {
         datasets: [
           { type: 'bar',  label: 'Fired',       data: trendData.fired,     backgroundColor: 'rgba(107,114,128,0.2)', borderColor: '#9ca3af', borderWidth: 1, borderRadius: 2, yAxisID: 'y',  order: 2 },
           { type: 'line', label: 'Opens',        data: trendData.opens,     borderColor: '#3b82f6', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
-          { type: 'line', label: 'Resolves',     data: trendData.resolves,  borderColor: '#10b981', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
           { type: 'line', label: 'Rec. Clicks',  data: trendData.recClicks, borderColor: '#f59e0b', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
         ],
       },
@@ -3307,7 +3301,7 @@ function AdoptionTrendChart({ trendData }) {
         scales: {
           x:  { ticks: { font: { size: 10 } }, grid: { display: false } },
           y:  { type: 'linear', position: 'left',  beginAtZero: true, title: { display: true, text: 'Fired', font: { size: 9 } }, grid: { color: '#f3f4f6' } },
-          y1: { type: 'linear', position: 'right', beginAtZero: true, title: { display: true, text: 'Opens / Resolves / Clicks', font: { size: 9 } }, grid: { drawOnChartArea: false } },
+          y1: { type: 'linear', position: 'right', beginAtZero: true, title: { display: true, text: 'Opens / Clicks', font: { size: 9 } }, grid: { drawOnChartArea: false } },
         },
       },
     });
@@ -3439,13 +3433,13 @@ function AdoptionScreen() {
     const headers = [
       axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
       ...(isUser ? [] : ['Fired', 'Total Alerts', 'Users Reached']),
-      'Opens', 'Opened by', 'Rec. Clicks', 'Resolves',
+      'Opens', 'Opened by', 'Rec. Clicks',
       ...(isUser ? [] : ['Opens/Total Alerts %']),
     ];
     const dataRows = sortedRows.map((r) => [
       `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
       ...(isUser ? [] : [r.fired ?? '', r.totalAlerts ?? '', r.reachUsers ?? '']),
-      r.opens, r.openedBy, r.recClicks, r.resolves,
+      r.opens, r.openedBy, r.recClicks,
       ...(isUser ? [] : [r.opensTotalAlerts != null ? r.opensTotalAlerts.toFixed(1) : '']),
     ].join(','));
     const csv   = [headers.join(','), ...dataRows].join('\r\n');
@@ -3475,7 +3469,6 @@ function AdoptionScreen() {
     opens: 'Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). Source: alert_user_activity.',
     openedBy: 'Distinct user emails with at least one Open in this slice. Source: alert_user_activity.',
     recClicks: 'RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System bug: these are written as UNDO in the DB but actually mean the user clicked the co-pilot recommendation button. Source: alert_user_activity.',
-    resolves: 'Count of RECOMMENDATION + RESOLVE events. All resolves counted. Source: alert_user_activity.',
     opensTotalAlerts: 'Opens ÷ Total Alerts × 100%. Uses overlap-based Total Alerts as denominator. Not shown at user level. Source: alert_overview + alert_user_activity.',
   };
 
@@ -3495,7 +3488,6 @@ function AdoptionScreen() {
     { label: 'Fired',        count: kpis.fired,       color: '#6b7280' },
     { label: 'Opened',       count: kpis.opens,       color: '#3b82f6' },
     { label: 'Rec. Clicked', count: kpis.recClicks,   color: '#f59e0b' },
-    { label: 'Resolved',     count: kpis.resolves,    color: '#10b981' },
   ] : [];
 
   return (
@@ -3560,7 +3552,7 @@ function AdoptionScreen() {
       {!loading && !error && merged && (
         <>
           {/* ── KPI cards ───────────────────────────────────────────────── */}
-          <div className="grid grid-cols-7 gap-3">
+          <div className="grid grid-cols-6 gap-3">
             <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}             accent="#374151"
               tip="Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt." />
             <KpiTile label="Total Alerts"   value={kpis.totalAlerts.toLocaleString()}        accent="#6366f1"
@@ -3571,8 +3563,6 @@ function AdoptionScreen() {
               tip="Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). 'by N users' = distinct user emails with at least one open. Source: alert_user_activity." />
             <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}          sub="co-pilot button tapped" accent="#d97706"
               tip="RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System quirk: these are written as UNDO in the DB but actually mean the user tapped the co-pilot recommendation button. Source: alert_user_activity." />
-            <KpiTile label="Resolves"       value={kpis.resolves.toLocaleString()}           accent="#059669"
-              tip="Count of RECOMMENDATION + RESOLVE events. All resolves are counted regardless of which recommendation was acted on. Source: alert_user_activity." />
             <div className="cursor-pointer" onClick={() => { setAxis('user'); setSortKey('opens'); setSortDir('desc'); }}>
               <KpiTile label="Engaged Users" value={kpis.engagedUsers.toLocaleString()} sub="click to view by user"
                 accent="#7c3aed" tone="bg-violet-50 border-violet-200"
@@ -3684,7 +3674,6 @@ function AdoptionScreen() {
                     <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
                     <th {...thProps('openedBy', true)}>Opened by{sortIcon('openedBy')}</th>
                     <th {...thProps('recClicks', true)}>Rec. Clicks{sortIcon('recClicks')}</th>
-                    <th {...thProps('resolves', true)}>Resolves{sortIcon('resolves')}</th>
                     {!isUser && (
                       <th {...thProps('opensTotalAlerts', true)}>Opens/Total Alerts{sortIcon('opensTotalAlerts')}</th>
                     )}
@@ -3717,7 +3706,7 @@ function AdoptionScreen() {
                 <tbody className="divide-y divide-gray-100">
                   {sortedRows.length === 0 && (
                     <tr>
-                      <td colSpan={isUser ? 5 : 9} className="px-4 py-10 text-center text-sm text-gray-400">
+                      <td colSpan={isUser ? 4 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
                         No data for the selected filters and date range.
                       </td>
                     </tr>
@@ -3754,7 +3743,6 @@ function AdoptionScreen() {
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.opens.toLocaleString()}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-500'}>{row.openedBy}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.recClicks.toLocaleString()}</td>
-                      <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.resolves.toLocaleString()}</td>
                       {!isUser && (
                         <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
                           {row.opensTotalAlerts != null ? row.opensTotalAlerts.toFixed(1) + '%' : '—'}
@@ -3791,7 +3779,6 @@ function AdoptionScreen() {
                   <li><strong>Opens:</strong> Every <code className="bg-gray-100 px-0.5 rounded">activityType=ANALYSIS, action=CLICKED</code> event. Each click = +1.</li>
                   <li><strong>Opened by:</strong> Count of distinct user emails with at least one Open.</li>
                   <li><strong>Rec. Clicks:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.coPilotRecommendationClicked=true</code>. These are written as UNDO due to a system bug but actually mean the user clicked the co-pilot recommendation button.</li>
-                  <li><strong>Resolves:</strong> All <code className="bg-gray-100 px-0.5 rounded">activityType=RECOMMENDATION, action=RESOLVE</code> events.</li>
                   <li><strong>Opens/Total Alerts:</strong> Opens ÷ Total Alerts × 100%. Uses the overlap-based Total Alerts as denominator. Never shown at user level.</li>
                   <li><strong>Engaged Users:</strong> Distinct users with any Open or Resolve in the slice.</li>
                 </ul>

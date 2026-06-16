@@ -1474,7 +1474,7 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
           { $eq:  [{ $toString: '$_id' }, '$$sid'] },
         ] } } },
         { $limit: 1 },
-        { $project: { name: 1 } },
+        { $project: { name: 1, signalType: 1 } },
       ],
       as: '_signal',
     } },
@@ -1487,8 +1487,9 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
         stage:        '$stage',
         userEmail:    '$userEmail',
       },
-      count:      { $sum: 1 },
-      signalName: { $first: { $ifNull: [{ $arrayElemAt: ['$_signal.name', 0] }, ''] } },
+      count:       { $sum: 1 },
+      signalName:  { $first: { $ifNull: [{ $arrayElemAt: ['$_signal.name', 0] }, ''] } },
+      signalType:  { $first: { $ifNull: [{ $arrayElemAt: ['$_signal.signalType', 0] }, ''] } },
     } },
   ], { allowDiskUse: true }).toArray();
 
@@ -1502,7 +1503,7 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
     tenantSet.add(r._id.tenantCode);
     facilitySet.add(r._id.facilityCode);
     const sid = r._id.signalId;
-    if (sid && !signalMap.has(sid)) signalMap.set(sid, { id: sid, name: r.signalName || sid });
+    if (sid && !signalMap.has(sid)) signalMap.set(sid, { id: sid, name: r.signalName || sid, signalType: r.signalType || '' });
     if (r._id.userEmail) userSet.add(r._id.userEmail);
   }
 
