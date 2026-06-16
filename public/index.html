@@ -3083,13 +3083,18 @@ function todayIST() {
  * unified master arrays with remapped indices so both row sets use the
  * same index space.
  */
-function mergeAdoptionData(fr, ar) {
+function mergeAdoptionData(fr, ar, tar) {
   const tSet = new Set([...fr.tenants, ...ar.tenants]);
   const fSet = new Set([...fr.facilities, ...ar.facilities]);
 
   const sigById = new Map();
   (fr.signals || []).forEach((s) => { if (s?.id) sigById.set(s.id, s); });
   (ar.signals || []).forEach((s) => { if (s?.id && !sigById.has(s.id)) sigById.set(s.id, s); });
+
+  // Merge total-alerts dimensions
+  (tar?.tenants   || []).forEach((t) => tSet.add(t));
+  (tar?.facilities || []).forEach((f) => fSet.add(f));
+  (tar?.signals   || []).forEach((s) => { if (s?.id && !sigById.has(s.id)) sigById.set(s.id, s); });
 
   const tenants    = [...tSet].sort();
   const facilities = [...fSet].sort();
@@ -3128,7 +3133,20 @@ function mergeAdoptionData(fr, ar) {
     ];
   });
 
-  return { tenants, facilities, signals, users, firedRows, actRows, tMap, fMap, sMap, uMap };
+  // Remap total-alerts rows [tIdx, fIdx, sIdx, count] into unified index space
+  const totalAlertsRows = (tar?.rows || []).map((r) => {
+    const t = tar.tenants[r[0]];
+    const f = tar.facilities[r[1]];
+    const s = tar.signals[r[2]];
+    return [
+      tMap.has(t) ? tMap.get(t) : -1,
+      fMap.has(f) ? fMap.get(f) : -1,
+      s && sMap.has(s.id) ? sMap.get(s.id) : -1,
+      r[3],
+    ];
+  });
+
+  return { tenants, facilities, signals, users, firedRows, actRows, totalAlertsRows, tMap, fMap, sMap, uMap };
 }
 
 function applyAdoptionChips(rows, chips, merged, hasUserDim) {
@@ -3144,13 +3162,14 @@ function applyAdoptionChips(rows, chips, merged, hasUserDim) {
   });
 }
 
-function computeAdoptionKPIs(filtFired, filtAct) {
-  let fired = 0, opens = 0, resolves = 0, recClicks = 0;
+function computeAdoptionKPIs(filtFired, filtAct, filtTotalAlerts) {
+  let fired = 0, opens = 0, resolves = 0, recClicks = 0, totalAlerts = 0;
   const openUserSet  = new Set();
   const engUserSet   = new Set();
   const reachUserSet = new Set();
 
   for (const r of filtFired) fired += r[4];
+  for (const r of filtTotalAlerts) totalAlerts += r[3];
   for (const r of filtAct) {
     const [,,,, stage, uIdx, cnt] = r;
     if (stage === 1) { opens += cnt;     if (uIdx >= 0) openUserSet.add(uIdx); }
@@ -3160,15 +3179,15 @@ function computeAdoptionKPIs(filtFired, filtAct) {
     if (uIdx >= 0)     engUserSet.add(uIdx);
   }
 
-  return { fired, opens, openedBy: openUserSet.size, resolves, recClicks, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
+  return { fired, opens, openedBy: openUserSet.size, resolves, recClicks, totalAlerts, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
 }
 
-function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
+function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotalAlerts) {
   if (!merged) return [];
   const grouped = new Map(); // key → bucket
 
   const ensure = (key) => {
-    if (!grouped.has(key)) grouped.set(key, { fired: 0, opens: 0, openUsers: new Set(), resolves: 0, recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
+    if (!grouped.has(key)) grouped.set(key, { fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), resolves: 0, recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
     return grouped.get(key);
   };
 
@@ -3184,8 +3203,8 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
     }
     return [...grouped.entries()].map(([idx, g]) => ({
       key: idx, name: merged.users[idx] || '?', label: merged.users[idx] || '?',
-      fired: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
-      resolves: g.resolves, recClicks: g.recClicks, opensFired: null,
+      fired: null, totalAlerts: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
+      resolves: g.resolves, recClicks: g.recClicks, opensTotalAlerts: null,
     }));
   }
 
@@ -3197,6 +3216,12 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
     const g = ensure(key);
     g.fired += r[4];
     if (axis === 'facility') g.parentTenants.add(r[0]);
+  }
+
+  for (const r of (filtTotalAlerts || [])) {
+    const key = r[dim];
+    if (key < 0) continue;
+    ensure(key).totalAlerts += r[3];
   }
 
   for (const r of filtAct) {
@@ -3224,13 +3249,13 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) {
         .join(', ');
       label = `${rawName} · ${tenantNames}`;
     }
-    const opensFired = g.fired > 0 ? parseFloat(((g.opens / g.fired) * 100).toFixed(1)) : null;
+    const opensTotalAlerts = g.totalAlerts > 0 ? parseFloat(((g.opens / g.totalAlerts) * 100).toFixed(1)) : null;
     // reachUsers only meaningful at tenant/facility level; signal has no FETCH attribution
     const reachUsers = axis === 'signal' ? null : g.reachUsers.size;
     return {
       key: idx, name: rawName, label,
-      fired: g.fired, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
-      resolves: g.resolves, recClicks: g.recClicks, opensFired,
+      fired: g.fired, totalAlerts: g.totalAlerts, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
+      resolves: g.resolves, recClicks: g.recClicks, opensTotalAlerts,
     };
   });
 }
@@ -3302,24 +3327,27 @@ function AdoptionScreen() {
   const [sortDir,  setSortDir]  = useState('desc');
   const [excludedUsers, setExcludedUsers] = useState(['techsupport@unicommerce.com']);
   const [newExclUser,   setNewExclUser]   = useState('');
-  const [firedData, setFiredData] = useState(null);
-  const [actData,   setActData]   = useState(null);
-  const [loading,   setLoading]   = useState(true);
-  const [error,     setError]     = useState(null);
-  const [retryCount, setRetryCount] = useState(0);
+  const [firedData,       setFiredData]       = useState(null);
+  const [actData,         setActData]         = useState(null);
+  const [totalAlertsData, setTotalAlertsData] = useState(null);
+  const [loading,         setLoading]         = useState(true);
+  const [error,           setError]           = useState(null);
+  const [retryCount,      setRetryCount]      = useState(0);
 
-  // ── Fetch both endpoints whenever filters change ─────────────────────────
+  // ── Fetch all three endpoints whenever filters change ───────────────────
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     const params = new URLSearchParams({ from: dateFrom, to: dateTo });
     if (excludedUsers.length) params.set('excludedUsers', excludedUsers.join(','));
+    const baseParams = new URLSearchParams({ from: dateFrom, to: dateTo });
     Promise.all([
       apiFetch(`/api/adoption/fired?${params}`),
       apiFetch(`/api/adoption/activity?${params}`),
-    ]).then(([fd, ad]) => {
-      if (!cancelled) { setFiredData(fd); setActData(ad); setLoading(false); }
+      apiFetch(`/api/adoption/total-alerts?${baseParams}`),
+    ]).then(([fd, ad, tad]) => {
+      if (!cancelled) { setFiredData(fd); setActData(ad); setTotalAlertsData(tad); setLoading(false); }
     }).catch((e) => {
       if (!cancelled) { setError(e.message); setLoading(false); }
     });
@@ -3328,9 +3356,9 @@ function AdoptionScreen() {
 
   // ── Client-side pivot ────────────────────────────────────────────────────
   const merged = useMemo(() => {
-    if (!firedData || !actData) return null;
-    return mergeAdoptionData(firedData, actData);
-  }, [firedData, actData]);
+    if (!firedData || !actData || !totalAlertsData) return null;
+    return mergeAdoptionData(firedData, actData, totalAlertsData);
+  }, [firedData, actData, totalAlertsData]);
 
   const filtFired = useMemo(
     () => merged ? applyAdoptionChips(merged.firedRows, chips, merged, false) : [],
@@ -3340,10 +3368,14 @@ function AdoptionScreen() {
     () => merged ? applyAdoptionChips(merged.actRows, chips, merged, true) : [],
     [merged, chips]
   );
+  const filtTotalAlerts = useMemo(
+    () => merged ? applyAdoptionChips(merged.totalAlertsRows, chips, merged, false) : [],
+    [merged, chips]
+  );
 
-  const kpis         = useMemo(() => computeAdoptionKPIs(filtFired, filtAct),                             [filtFired, filtAct]);
-  const explorerRows = useMemo(() => merged ? computeAdoptionExplorerRows(axis, filtFired, filtAct, merged) : [], [axis, filtFired, filtAct, merged]);
-  const trendData    = useMemo(() => computeAdoptionTrendData(filtFired, filtAct),                        [filtFired, filtAct]);
+  const kpis         = useMemo(() => computeAdoptionKPIs(filtFired, filtAct, filtTotalAlerts),                                        [filtFired, filtAct, filtTotalAlerts]);
+  const explorerRows = useMemo(() => merged ? computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotalAlerts) : [], [axis, filtFired, filtAct, merged, filtTotalAlerts]);
+  const trendData    = useMemo(() => computeAdoptionTrendData(filtFired, filtAct),                                                     [filtFired, filtAct]);
 
   const sortedRows = useMemo(() => {
     const rows = [...explorerRows];
@@ -3406,15 +3438,15 @@ function AdoptionScreen() {
     const isUser = axis === 'user';
     const headers = [
       axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
-      ...(isUser ? [] : ['Fired', 'Users Reached']),
-      'Opens', 'Opened by', 'Resolves', 'Rec. Clicks',
-      ...(isUser ? [] : ['Opens/Fired %']),
+      ...(isUser ? [] : ['Fired', 'Total Alerts', 'Users Reached']),
+      'Opens', 'Opened by', 'Rec. Clicks', 'Resolves',
+      ...(isUser ? [] : ['Opens/Total Alerts %']),
     ];
     const dataRows = sortedRows.map((r) => [
       `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
-      ...(isUser ? [] : [r.fired ?? '', r.reachUsers ?? '']),
-      r.opens, r.openedBy, r.resolves, r.recClicks,
-      ...(isUser ? [] : [r.opensFired != null ? r.opensFired.toFixed(1) : '']),
+      ...(isUser ? [] : [r.fired ?? '', r.totalAlerts ?? '', r.reachUsers ?? '']),
+      r.opens, r.openedBy, r.recClicks, r.resolves,
+      ...(isUser ? [] : [r.opensTotalAlerts != null ? r.opensTotalAlerts.toFixed(1) : '']),
     ].join(','));
     const csv   = [headers.join(','), ...dataRows].join('\r\n');
     const blob  = new Blob([csv], { type: 'text/csv' });
@@ -3438,12 +3470,13 @@ function AdoptionScreen() {
   const COL_TIPS = {
     name: 'Click any row name to add it as a filter chip and drill deeper. Chips combine freely across Tenant → Facility → Signal → User.',
     fired: 'Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt. Not shown at user level — firing has no user attribution.',
+    totalAlerts: 'alert_overview docs that overlapped the date range: firedAt < rangeEnd AND (resolvedAt >= rangeStart OR resolvedAt is null). Includes open/ongoing alerts. Not deduplicated per day. Source: alert_overview.',
     reachUsers: 'Distinct users who viewed the alerts list (GET_ALL_ALERTS / FETCH events) for this tenant or facility. Shows who has visibility of the alerts page, regardless of whether they opened any specific alert. Not available at signal or user level.',
     opens: 'Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). Source: alert_user_activity.',
     openedBy: 'Distinct user emails with at least one Open in this slice. Source: alert_user_activity.',
-    resolves: 'Count of RECOMMENDATION + RESOLVE events. All resolves counted. Source: alert_user_activity.',
     recClicks: 'RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System bug: these are written as UNDO in the DB but actually mean the user clicked the co-pilot recommendation button. Source: alert_user_activity.',
-    opensFired: 'Opens ÷ Fired × 100%. Directional metric — mixes both data sources. Not shown at user level. Source: alert_overview + alert_user_activity.',
+    resolves: 'Count of RECOMMENDATION + RESOLVE events. All resolves counted. Source: alert_user_activity.',
+    opensTotalAlerts: 'Opens ÷ Total Alerts × 100%. Uses overlap-based Total Alerts as denominator. Not shown at user level. Source: alert_overview + alert_user_activity.',
   };
 
   const [tipState, setTipState] = useState(null); // { x, y, text }
@@ -3459,10 +3492,10 @@ function AdoptionScreen() {
   });
 
   const funnelItems = merged ? [
-    { label: 'Fired',       count: kpis.fired,     color: '#6b7280' },
-    { label: 'Opened',      count: kpis.opens,     color: '#3b82f6' },
-    { label: 'Resolved',    count: kpis.resolves,  color: '#10b981' },
-    { label: 'Rec. Clicked', count: kpis.recClicks, color: '#f59e0b' },
+    { label: 'Fired',        count: kpis.fired,       color: '#6b7280' },
+    { label: 'Opened',       count: kpis.opens,       color: '#3b82f6' },
+    { label: 'Rec. Clicked', count: kpis.recClicks,   color: '#f59e0b' },
+    { label: 'Resolved',     count: kpis.resolves,    color: '#10b981' },
   ] : [];
 
   return (
@@ -3527,17 +3560,19 @@ function AdoptionScreen() {
       {!loading && !error && merged && (
         <>
           {/* ── KPI cards ───────────────────────────────────────────────── */}
-          <div className="grid grid-cols-6 gap-3">
-            <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}        accent="#374151"
+          <div className="grid grid-cols-7 gap-3">
+            <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}             accent="#374151"
               tip="Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt." />
-            <KpiTile label="Users Reached"  value={kpis.reachUsers.toLocaleString()}   sub="viewed alerts list"  accent="#0891b2"
+            <KpiTile label="Total Alerts"   value={kpis.totalAlerts.toLocaleString()}        accent="#6366f1"
+              tip="Count of alert_overview docs that overlapped the selected date range: firedAt < rangeEnd AND (resolvedAt >= rangeStart OR resolvedAt is null). Includes open/ongoing alerts. Source: alert_overview." />
+            <KpiTile label="Users Reached"  value={kpis.reachUsers.toLocaleString()}         sub="viewed alerts list" accent="#0891b2"
               tip="Distinct users who opened the alerts list page at least once (GET_ALL_ALERTS / FETCH events). Measures visibility, not engagement. Source: alert_user_activity." />
-            <KpiTile label="Opens"          value={kpis.opens.toLocaleString()}        sub={`by ${kpis.openedBy} users`} accent="#2563eb"
+            <KpiTile label="Opens"          value={kpis.opens.toLocaleString()}              sub={`by ${kpis.openedBy} users`} accent="#2563eb"
               tip="Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). 'by N users' = distinct user emails with at least one open. Source: alert_user_activity." />
-            <KpiTile label="Resolves"       value={kpis.resolves.toLocaleString()}     accent="#059669"
-              tip="Count of RECOMMENDATION + RESOLVE events. All resolves are counted regardless of which recommendation was acted on. Source: alert_user_activity." />
-            <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}    sub="co-pilot button tapped" accent="#d97706"
+            <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}          sub="co-pilot button tapped" accent="#d97706"
               tip="RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System quirk: these are written as UNDO in the DB but actually mean the user tapped the co-pilot recommendation button. Source: alert_user_activity." />
+            <KpiTile label="Resolves"       value={kpis.resolves.toLocaleString()}           accent="#059669"
+              tip="Count of RECOMMENDATION + RESOLVE events. All resolves are counted regardless of which recommendation was acted on. Source: alert_user_activity." />
             <div className="cursor-pointer" onClick={() => { setAxis('user'); setSortKey('opens'); setSortDir('desc'); }}>
               <KpiTile label="Engaged Users" value={kpis.engagedUsers.toLocaleString()} sub="click to view by user"
                 accent="#7c3aed" tone="bg-violet-50 border-violet-200"
@@ -3570,7 +3605,7 @@ function AdoptionScreen() {
                 })}
               </div>
               <p className="text-[10px] text-gray-400 mt-3">
-                Opens/Fired: {kpis.fired > 0 ? ((kpis.opens / kpis.fired) * 100).toFixed(1) + '%' : '—'}
+                Opens/Total Alerts: {kpis.totalAlerts > 0 ? ((kpis.opens / kpis.totalAlerts) * 100).toFixed(1) + '%' : '—'}
                 {' · '}Opened by {kpis.openedBy} distinct users
               </p>
             </div>
@@ -3641,14 +3676,17 @@ function AdoptionScreen() {
                       <th {...thProps('fired', true)}>Fired{sortIcon('fired')}</th>
                     )}
                     {!isUser && (
+                      <th {...thProps('totalAlerts', true)}>Total Alerts{sortIcon('totalAlerts')}</th>
+                    )}
+                    {!isUser && (
                       <th {...thProps('reachUsers', true)}>Users Reached{sortIcon('reachUsers')}</th>
                     )}
                     <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
                     <th {...thProps('openedBy', true)}>Opened by{sortIcon('openedBy')}</th>
-                    <th {...thProps('resolves', true)}>Resolves{sortIcon('resolves')}</th>
                     <th {...thProps('recClicks', true)}>Rec. Clicks{sortIcon('recClicks')}</th>
+                    <th {...thProps('resolves', true)}>Resolves{sortIcon('resolves')}</th>
                     {!isUser && (
-                      <th {...thProps('opensFired', true)}>Opens/Fired{sortIcon('opensFired')}</th>
+                      <th {...thProps('opensTotalAlerts', true)}>Opens/Total Alerts{sortIcon('opensTotalAlerts')}</th>
                     )}
                   </tr>
                 </thead>
@@ -3679,7 +3717,7 @@ function AdoptionScreen() {
                 <tbody className="divide-y divide-gray-100">
                   {sortedRows.length === 0 && (
                     <tr>
-                      <td colSpan={isUser ? 5 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
+                      <td colSpan={isUser ? 5 : 9} className="px-4 py-10 text-center text-sm text-gray-400">
                         No data for the selected filters and date range.
                       </td>
                     </tr>
@@ -3704,17 +3742,22 @@ function AdoptionScreen() {
                         </td>
                       )}
                       {!isUser && (
+                        <td className={tdCls + ' text-right tabular-nums font-medium'} style={{ color: '#6366f1' }}>
+                          {row.totalAlerts != null ? row.totalAlerts.toLocaleString() : '—'}
+                        </td>
+                      )}
+                      {!isUser && (
                         <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
                           {row.reachUsers != null ? row.reachUsers.toLocaleString() : '—'}
                         </td>
                       )}
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.opens.toLocaleString()}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-500'}>{row.openedBy}</td>
-                      <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.resolves.toLocaleString()}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.recClicks.toLocaleString()}</td>
+                      <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.resolves.toLocaleString()}</td>
                       {!isUser && (
                         <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
-                          {row.opensFired != null ? row.opensFired.toFixed(1) + '%' : '—'}
+                          {row.opensTotalAlerts != null ? row.opensTotalAlerts.toFixed(1) + '%' : '—'}
                         </td>
                       )}
                     </tr>
@@ -3734,20 +3777,22 @@ function AdoptionScreen() {
             </summary>
             <div className="px-4 pb-4 pt-1 border-t border-gray-100 text-sm text-gray-600 space-y-4">
               <div>
-                <p className="font-semibold text-gray-800 mb-1">Two data sources</p>
+                <p className="font-semibold text-gray-800 mb-1">Three data sources</p>
                 <p><strong>Source 1 — Fired:</strong> <code className="bg-gray-100 px-1 rounded text-xs">alert_overview.firedAt</code>. Each row = one distinct signal instance. Deduped by tenant + facility + signalId + IST date.</p>
                 <p className="mt-1"><strong>Source 2 — Activity:</strong> <code className="bg-gray-100 px-1 rounded text-xs">alert_user_activity</code>. Records every user interaction. Joined via alertId → alert_overview → signal name. <code className="bg-gray-100 px-1 rounded text-xs">GET_ALL_ALERTS</code> / background fetch events are excluded.</p>
+                <p className="mt-1"><strong>Source 3 — Total Alerts:</strong> <code className="bg-gray-100 px-1 rounded text-xs">alert_overview</code> overlap query. Counts all alert documents (not deduplicated per day) that were visible during the selected range — includes alerts fired before the range that were still open, and alerts that resolved mid-range.</p>
               </div>
               <div>
                 <p className="font-semibold text-gray-800 mb-1">Metric definitions</p>
                 <ul className="space-y-1 text-xs list-disc list-inside">
-                  <li><strong>Fired:</strong> Deduped signal instances from Source 1. Never shown at user level.</li>
+                  <li><strong>Fired:</strong> Deduped signal instances from Source 1 (firedAt in range). Dedup key: tenant + facility + signalId + IST date. Never shown at user level.</li>
+                  <li><strong>Total Alerts:</strong> Count of <code className="bg-gray-100 px-0.5 rounded">alert_overview</code> docs that overlapped the date range: <code className="bg-gray-100 px-0.5 rounded">firedAt &lt; rangeEnd AND (resolvedAt &ge; rangeStart OR resolvedAt is null)</code>. Includes open/ongoing alerts. Not deduplicated per day. Never shown at user level.</li>
                   <li><strong>Users Reached:</strong> Distinct users who viewed the alerts list (GET_ALL_ALERTS/FETCH) for that tenant or facility. Shows who has visibility of the page, not necessarily engagement. Not available at signal or user level.</li>
                   <li><strong>Opens:</strong> Every <code className="bg-gray-100 px-0.5 rounded">activityType=ANALYSIS, action=CLICKED</code> event. Each click = +1.</li>
                   <li><strong>Opened by:</strong> Count of distinct user emails with at least one Open.</li>
-                  <li><strong>Resolves:</strong> All <code className="bg-gray-100 px-0.5 rounded">activityType=RECOMMENDATION, action=RESOLVE</code> events.</li>
                   <li><strong>Rec. Clicks:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.coPilotRecommendationClicked=true</code>. These are written as UNDO due to a system bug but actually mean the user clicked the co-pilot recommendation button.</li>
-                  <li><strong>Opens/Fired:</strong> Opens ÷ Fired × 100%. Directional (mixes both sources). Never shown at user level.</li>
+                  <li><strong>Resolves:</strong> All <code className="bg-gray-100 px-0.5 rounded">activityType=RECOMMENDATION, action=RESOLVE</code> events.</li>
+                  <li><strong>Opens/Total Alerts:</strong> Opens ÷ Total Alerts × 100%. Uses the overlap-based Total Alerts as denominator. Never shown at user level.</li>
                   <li><strong>Engaged Users:</strong> Distinct users with any Open or Resolve in the slice.</li>
                 </ul>
               </div>

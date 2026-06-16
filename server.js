@@ -1338,6 +1338,75 @@ app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res
 }));
 
 /**
+ * GET /api/adoption/total-alerts?from=YYYY-MM-DD&to=YYYY-MM-DD
+ *
+ * Counts alert_overview documents that overlapped the selected date range.
+ * Overlap: firedAt < rangeEnd AND (resolvedAt >= rangeStart OR resolvedAt absent/null).
+ * Groups by tenantCode + facilityCode + signalId (no per-day dedup).
+ * Always excludes INTERNAL_TENANTS.
+ */
+app.get('/api/adoption/total-alerts', asyncRoute('/api/adoption/total-alerts', async (req, res) => {
+  const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
+
+  const rows = await db.collection('alert_overview').aggregate([
+    { $match: {
+      firedAt:    { $lt: toDate },
+      tenantCode: { $nin: INTERNAL_TENANTS },
+      $or: [
+        { resolvedAt: { $gte: fromDate } },
+        { resolvedAt: null },
+        { resolvedAt: { $exists: false } },
+      ],
+    } },
+    { $addFields: { signalIdStr: { $toString: '$signalId' } } },
+    { $group: {
+      _id: { tenantCode: '$tenantCode', facilityCode: '$facilityCode', signalId: '$signalIdStr' },
+      count: { $sum: 1 },
+    } },
+    { $lookup: {
+      from: 'signals_master',
+      let: { sid: '$_id.signalId' },
+      pipeline: [
+        { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$sid'] } } },
+        { $limit: 1 },
+        { $project: { name: 1, signalCode: 1 } },
+      ],
+      as: '_signal',
+    } },
+  ], { allowDiskUse: true }).toArray();
+
+  const tenantSet   = new Set();
+  const facilitySet = new Set();
+  const signalMap   = new Map();
+
+  for (const r of rows) {
+    tenantSet.add(r._id.tenantCode);
+    facilitySet.add(r._id.facilityCode);
+    const sid = r._id.signalId;
+    if (!signalMap.has(sid)) {
+      const meta = r._signal?.[0] ?? {};
+      signalMap.set(sid, { id: sid, name: meta.name ?? sid, signalCode: meta.signalCode ?? null });
+    }
+  }
+
+  const tenants    = [...tenantSet].sort();
+  const facilities = [...facilitySet].sort();
+  const signals    = [...signalMap.values()];
+  const tIdx       = new Map(tenants.map((t, i) => [t, i]));
+  const fIdx       = new Map(facilities.map((f, i) => [f, i]));
+  const sIdx       = new Map(signals.map((s, i) => [s.id, i]));
+
+  const totalRows = rows.map((r) => [
+    tIdx.get(r._id.tenantCode)   ?? -1,
+    fIdx.get(r._id.facilityCode) ?? -1,
+    sIdx.get(r._id.signalId)     ?? -1,
+    r.count,
+  ]);
+
+  res.json({ tenants, facilities, signals, rows: totalRows });
+}));
+
+/**
  * GET /api/adoption/activity?from=YYYY-MM-DD&to=YYYY-MM-DD&excludedUsers=a,b
  *
  * Returns aggregated engagement events from alert_user_activity.
