@@ -4,23 +4,27 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Alert Dashboard</title>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+  <script src="/vendor/tailwind-play.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            critical: { DEFAULT: '#dc2626', light: '#fef2f2', border: '#fecaca' },
-            warning:  { DEFAULT: '#d97706', light: '#fffbeb', border: '#fde68a' },
-            low:      { DEFAULT: '#2563eb', light: '#eff6ff', border: '#bfdbfe' },
+    // The static Tailwind build (jsDelivr CSS) does not expose a runtime
+    // `tailwind` global, so only apply config when running the JIT CDN script.
+    if (typeof tailwind !== 'undefined') {
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              critical: { DEFAULT: '#dc2626', light: '#fef2f2', border: '#fecaca' },
+              warning:  { DEFAULT: '#d97706', light: '#fffbeb', border: '#fde68a' },
+              low:      { DEFAULT: '#2563eb', light: '#eff6ff', border: '#bfdbfe' },
+            }
           }
         }
-      }
-    };
+      };
+    }
   </script>
   <style>
     * { box-sizing: border-box; }
