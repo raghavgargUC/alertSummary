@@ -3190,7 +3190,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
   const grouped = new Map(); // key → bucket
 
   const ensure = (key) => {
-    if (!grouped.has(key)) grouped.set(key, { fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), recClicks: 0, reachUsers: new Set(), parentTenants: new Set() });
+    if (!grouped.has(key)) grouped.set(key, { fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), recClicks: 0, reachUsers: new Set(), parentTenants: new Set(), csvDownloads: 0, csvUsers: new Set() });
     return grouped.get(key);
   };
 
@@ -3202,11 +3202,13 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       const stage = r[4], cnt = r[6];
       if (stage === 1) { g.opens += cnt; g.openUsers.add(uIdx); }
       if (stage === 4) g.recClicks += cnt;
+      if (stage === 5) { g.csvDownloads += cnt; g.csvUsers.add(uIdx); }
     }
     return [...grouped.entries()].map(([idx, g]) => ({
       key: idx, name: merged.users[idx] || '?', label: merged.users[idx] || '?',
       fired: null, totalAlerts: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
       recClicks: g.recClicks, opensTotalAlerts: null,
+      csvDownloads: g.csvDownloads, csvDownloadedBy: g.csvUsers.size,
     }));
   }
 
@@ -3234,6 +3236,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
     if (stage === 1) { g.opens += cnt; if (r[5] >= 0) g.openUsers.add(r[5]); }
     if (stage === 2) { if (r[5] >= 0) g.reachUsers.add(r[5]); }
     if (stage === 4) g.recClicks += cnt;
+    if (stage === 5) { g.csvDownloads += cnt; if (r[5] >= 0) g.csvUsers.add(r[5]); }
     if (axis === 'facility') g.parentTenants.add(r[0]);
   }
 
@@ -3257,6 +3260,7 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       key: idx, name: rawName, label,
       fired: g.fired, totalAlerts: g.totalAlerts, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
       recClicks: g.recClicks, opensTotalAlerts,
+      csvDownloads: g.csvDownloads, csvDownloadedBy: g.csvUsers.size,
     };
   });
 }
@@ -3321,7 +3325,7 @@ function AdoptionScreen() {
   const [dateTo,   setDateTo]   = useState(todayIST);
   const [chips,    setChips]    = useState([]);    // [{axis, value, label}]
   const [axis,     setAxis]     = useState('tenant');
-  const [sortKey,  setSortKey]  = useState('fired');
+  const [sortKey,  setSortKey]  = useState('opens');
   const [sortDir,  setSortDir]  = useState('desc');
   const [excludedUsers, setExcludedUsers] = useState(['techsupport@unicommerce.com']);
   const [newExclUser,   setNewExclUser]   = useState('');
@@ -3436,15 +3440,13 @@ function AdoptionScreen() {
     const isUser = axis === 'user';
     const headers = [
       axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
-      ...(isUser ? [] : ['Fired', 'Total Alerts', 'Users Reached']),
-      'Opens', 'Opened by', 'Rec. Clicks',
-      ...(isUser ? [] : ['Opens/Total Alerts %']),
+      ...(isUser ? [] : ['Total Alerts', 'Users Reached']),
+      'Opens', 'Opened by', 'Rec. Clicks', 'CSV Download', 'CSV Download by',
     ];
     const dataRows = sortedRows.map((r) => [
       `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
-      ...(isUser ? [] : [r.fired ?? '', r.totalAlerts ?? '', r.reachUsers ?? '']),
-      r.opens, r.openedBy, r.recClicks,
-      ...(isUser ? [] : [r.opensTotalAlerts != null ? r.opensTotalAlerts.toFixed(1) : '']),
+      ...(isUser ? [] : [r.totalAlerts ?? '', r.reachUsers ?? '']),
+      r.opens, r.openedBy, r.recClicks, r.csvDownloads ?? 0, r.csvDownloadedBy ?? 0,
     ].join(','));
     const csv   = [headers.join(','), ...dataRows].join('\r\n');
     const blob  = new Blob([csv], { type: 'text/csv' });
@@ -3472,8 +3474,10 @@ function AdoptionScreen() {
     reachUsers: 'Distinct users who viewed the alerts list (GET_ALL_ALERTS / FETCH events) for this tenant or facility. Shows who has visibility of the alerts page, regardless of whether they opened any specific alert. Not available at signal or user level.',
     opens: 'Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). Source: alert_user_activity.',
     openedBy: 'Distinct user emails with at least one Open in this slice. Source: alert_user_activity.',
-    recClicks: 'RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System bug: these are written as UNDO in the DB but actually mean the user clicked the co-pilot recommendation button. Source: alert_user_activity.',
+    recClicks: 'RECOMMENDATION + UNDO events where key_data.coPilotRecommendationClicked=true. System bug: these are written as UNDO in the DB but actually mean the user clicked the co-pilot recommendation button. CSV download events are excluded (counted separately). Source: alert_user_activity.',
     opensTotalAlerts: 'Opens ÷ Total Alerts × 100%. Uses overlap-based Total Alerts as denominator. Not shown at user level. Source: alert_overview + alert_user_activity.',
+    csvDownloads: 'RECOMMENDATION + UNDO events where key_data.recommendationId="ui_csv_download". Total count of CSV download events (every download counted separately). Source: alert_user_activity.',
+    csvDownloadedBy: 'Distinct user emails with at least one CSV download in this slice. Source: alert_user_activity.',
   };
 
   const [tipState, setTipState] = useState(null); // { x, y, text }
@@ -3662,9 +3666,6 @@ function AdoptionScreen() {
                       {sortIcon('name')}
                     </th>
                     {!isUser && (
-                      <th {...thProps('fired', true)}>Fired{sortIcon('fired')}</th>
-                    )}
-                    {!isUser && (
                       <th {...thProps('totalAlerts', true)}>Total Alerts{sortIcon('totalAlerts')}</th>
                     )}
                     {!isUser && (
@@ -3673,9 +3674,8 @@ function AdoptionScreen() {
                     <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
                     <th {...thProps('openedBy', true)}>Opened by{sortIcon('openedBy')}</th>
                     <th {...thProps('recClicks', true)}>Rec. Clicks{sortIcon('recClicks')}</th>
-                    {!isUser && (
-                      <th {...thProps('opensTotalAlerts', true)}>Opens/Total Alerts{sortIcon('opensTotalAlerts')}</th>
-                    )}
+                    <th {...thProps('csvDownloads', true)}>CSV Download{sortIcon('csvDownloads')}</th>
+                    <th {...thProps('csvDownloadedBy', true)}>CSV Download by{sortIcon('csvDownloadedBy')}</th>
                   </tr>
                 </thead>
 
@@ -3705,7 +3705,7 @@ function AdoptionScreen() {
                 <tbody className="divide-y divide-gray-100">
                   {sortedRows.length === 0 && (
                     <tr>
-                      <td colSpan={isUser ? 4 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
+                      <td colSpan={isUser ? 6 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
                         No data for the selected filters and date range.
                       </td>
                     </tr>
@@ -3725,11 +3725,6 @@ function AdoptionScreen() {
                         </button>
                       </td>
                       {!isUser && (
-                        <td className={tdCls + ' text-right tabular-nums text-gray-700'}>
-                          {row.fired != null ? row.fired.toLocaleString() : '—'}
-                        </td>
-                      )}
-                      {!isUser && (
                         <td className={tdCls + ' text-right tabular-nums font-medium'} style={{ color: '#6366f1' }}>
                           {row.totalAlerts != null ? row.totalAlerts.toLocaleString() : '—'}
                         </td>
@@ -3742,11 +3737,10 @@ function AdoptionScreen() {
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.opens.toLocaleString()}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-500'}>{row.openedBy}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.recClicks.toLocaleString()}</td>
-                      {!isUser && (
-                        <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
-                          {row.opensTotalAlerts != null ? row.opensTotalAlerts.toFixed(1) + '%' : '—'}
-                        </td>
-                      )}
+                      <td className={tdCls + ' text-right tabular-nums font-medium'} style={{ color: '#059669' }}>
+                        {(row.csvDownloads ?? 0).toLocaleString()}
+                      </td>
+                      <td className={tdCls + ' text-right tabular-nums text-gray-500'}>{row.csvDownloadedBy ?? 0}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -3777,7 +3771,9 @@ function AdoptionScreen() {
                   <li><strong>Users Reached:</strong> Distinct users who viewed the alerts list (GET_ALL_ALERTS/FETCH) for that tenant or facility. Shows who has visibility of the page, not necessarily engagement. Not available at signal or user level.</li>
                   <li><strong>Opens:</strong> Every <code className="bg-gray-100 px-0.5 rounded">activityType=ANALYSIS, action=CLICKED</code> event. Each click = +1.</li>
                   <li><strong>Opened by:</strong> Count of distinct user emails with at least one Open.</li>
-                  <li><strong>Rec. Clicks:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.coPilotRecommendationClicked=true</code>. These are written as UNDO due to a system bug but actually mean the user clicked the co-pilot recommendation button.</li>
+                  <li><strong>Rec. Clicks:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.coPilotRecommendationClicked=true</code>. These are written as UNDO due to a system bug but actually mean the user clicked the co-pilot recommendation button. CSV download events are excluded — they are counted under CSV Download instead.</li>
+                  <li><strong>CSV Download:</strong> Events where <code className="bg-gray-100 px-0.5 rounded">action=UNDO AND key_data.recommendationId="ui_csv_download"</code>. Total count of CSV download events (each download = +1), regardless of the co-pilot flag.</li>
+                  <li><strong>CSV Download by:</strong> Count of distinct user emails with at least one CSV download.</li>
                   <li><strong>Opens/Total Alerts:</strong> Opens ÷ Total Alerts × 100%. Uses the overlap-based Total Alerts as denominator. Never shown at user level.</li>
                 </ul>
               </div>
