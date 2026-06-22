@@ -1417,6 +1417,10 @@ app.get('/api/adoption/total-alerts', asyncRoute('/api/adoption/total-alerts', a
  *                   key_data.coPilotRecommendationClicked=true)
  *                  ↑ System bug: event is written as UNDO but actually means
  *                    "user clicked co-pilot recommendation button".
+ *   5 = CSV Download (activityType=RECOMMENDATION, action=UNDO,
+ *                   key_data.recommendationId='ui_csv_download')
+ *                  ↑ Takes priority over stage 4 so CSV downloads are tracked
+ *                    distinctly from co-pilot recommendation clicks.
  *
  * Joins alertId → alert_overview._id → signalId → signals_master.name.
  * Always excludes INTERNAL_TENANTS and the excludedUsers list.
@@ -1433,6 +1437,8 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
       { activityType: 'RECOMMENDATION', action: 'RESOLVE' },
       { activityType: 'RECOMMENDATION', action: 'UNDO',
         'key_data.coPilotRecommendationClicked': true },
+      { activityType: 'RECOMMENDATION', action: 'UNDO',
+        'key_data.recommendationId': 'ui_csv_download' },
       { activityType: 'GET_ALL_ALERTS', action: 'FETCH' },
     ],
   };
@@ -1459,6 +1465,7 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
           { case: { $and: [{ $eq: ['$activityType', 'ANALYSIS'] },       { $eq: ['$action', 'CLICKED'] }] }, then: 1 },
           { case: { $and: [{ $eq: ['$activityType', 'GET_ALL_ALERTS'] }, { $eq: ['$action', 'FETCH']   }] }, then: 2 },
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'RESOLVE'] }] }, then: 3 },
+          { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'UNDO'] }, { $eq: ['$key_data.recommendationId', 'ui_csv_download'] }] }, then: 5 },
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'UNDO']    }] }, then: 4 },
         ],
         default: 0,
