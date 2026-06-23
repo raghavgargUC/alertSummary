@@ -1256,6 +1256,34 @@ function parseExcludedUsers(raw) {
   return raw.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
+/**
+ * Parse the client filter query param. Defaults to 'uniware'.
+ * Valid values: 'uniware' | 'unireco' | 'all'. Anything else → 'uniware'.
+ */
+function parseClient(raw) {
+  const c = (raw || 'uniware').trim().toLowerCase();
+  return (c === 'unireco' || c === 'all') ? c : 'uniware';
+}
+
+/**
+ * Build a MongoDB match condition for the client filter, intended to be
+ * placed inside a $match's $and array (so it composes with existing $or clauses).
+ *   'uniware' → client === 'uniware' OR null / '' / missing
+ *   'unireco' → client === 'unireco'
+ *   'all'     → null (no client filtering)
+ */
+function clientMatchExpr(client) {
+  if (client === 'all') return null;
+  if (client === 'unireco') return { client: 'unireco' };
+  // uniware: explicit 'uniware', or absent/null/empty string
+  return { $or: [
+    { client: 'uniware' },
+    { client: null },           // matches null and missing field
+    { client: '' },
+    { client: { $exists: false } },
+  ] };
+}
+
 /** MongoDB aggregation expression: convert a UTC Date field to an IST YYYY-MM-DD string. */
 const istDateExpr = (fieldRef) => ({
   $dateToString: { format: '%Y-%m-%d', date: fieldRef, timezone: '+05:30' },
@@ -1271,12 +1299,16 @@ const istDateExpr = (fieldRef) => ({
  */
 app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res) => {
   const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
+  const clientCond = clientMatchExpr(parseClient(req.query.client));
+
+  const firedMatch = {
+    firedAt:    { $gte: fromDate, $lt: toDate },
+    tenantCode: { $nin: INTERNAL_TENANTS },
+  };
+  if (clientCond) firedMatch.$and = [clientCond];
 
   const rows = await db.collection('alert_overview').aggregate([
-    { $match: {
-      firedAt:    { $gte: fromDate, $lt: toDate },
-      tenantCode: { $nin: INTERNAL_TENANTS },
-    } },
+    { $match: firedMatch },
     { $addFields: {
       istDate:     istDateExpr('$firedAt'),
       signalIdStr: { $toString: '$signalId' },
@@ -1347,17 +1379,21 @@ app.get('/api/adoption/fired', asyncRoute('/api/adoption/fired', async (req, res
  */
 app.get('/api/adoption/total-alerts', asyncRoute('/api/adoption/total-alerts', async (req, res) => {
   const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
+  const clientCond = clientMatchExpr(parseClient(req.query.client));
+
+  const totalMatch = {
+    firedAt:    { $lt: toDate },
+    tenantCode: { $nin: INTERNAL_TENANTS },
+    $or: [
+      { resolvedAt: { $gte: fromDate } },
+      { resolvedAt: null },
+      { resolvedAt: { $exists: false } },
+    ],
+  };
+  if (clientCond) totalMatch.$and = [clientCond];
 
   const rows = await db.collection('alert_overview').aggregate([
-    { $match: {
-      firedAt:    { $lt: toDate },
-      tenantCode: { $nin: INTERNAL_TENANTS },
-      $or: [
-        { resolvedAt: { $gte: fromDate } },
-        { resolvedAt: null },
-        { resolvedAt: { $exists: false } },
-      ],
-    } },
+    { $match: totalMatch },
     { $addFields: { signalIdStr: { $toString: '$signalId' } } },
     { $group: {
       _id: { tenantCode: '$tenantCode', facilityCode: '$facilityCode', signalId: '$signalIdStr' },
@@ -1428,6 +1464,7 @@ app.get('/api/adoption/total-alerts', asyncRoute('/api/adoption/total-alerts', a
 app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (req, res) => {
   const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
   const excludedUsers = parseExcludedUsers(req.query.excludedUsers);
+  const clientCond = clientMatchExpr(parseClient(req.query.client));
 
   const baseMatch = {
     timestamp:  { $gte: fromDate, $lt: toDate },
@@ -1443,6 +1480,7 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
     ],
   };
   if (excludedUsers.length > 0) baseMatch.userEmail = { $nin: excludedUsers };
+  if (clientCond) baseMatch.$and = [clientCond];
 
   const rows = await db.collection('alert_user_activity').aggregate([
     { $match: baseMatch },

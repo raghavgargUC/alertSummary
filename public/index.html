@@ -3329,6 +3329,7 @@ function AdoptionScreen() {
   const [sortDir,  setSortDir]  = useState('desc');
   const [excludedUsers, setExcludedUsers] = useState(['techsupport@unicommerce.com']);
   const [newExclUser,   setNewExclUser]   = useState('');
+  const [clientFilter,  setClientFilter]  = useState('uniware'); // 'uniware' | 'unireco' | 'all'
   const [firedData,       setFiredData]       = useState(null);
   const [actData,         setActData]         = useState(null);
   const [totalAlertsData, setTotalAlertsData] = useState(null);
@@ -3343,7 +3344,9 @@ function AdoptionScreen() {
     setError(null);
     const params = new URLSearchParams({ from: dateFrom, to: dateTo });
     if (excludedUsers.length) params.set('excludedUsers', excludedUsers.join(','));
+    params.set('client', clientFilter);
     const baseParams = new URLSearchParams({ from: dateFrom, to: dateTo });
+    baseParams.set('client', clientFilter);
     Promise.all([
       apiFetch(`/api/adoption/fired?${params}`),
       apiFetch(`/api/adoption/activity?${params}`),
@@ -3354,7 +3357,7 @@ function AdoptionScreen() {
       if (!cancelled) { setError(e.message); setLoading(false); }
     });
     return () => { cancelled = true; };
-  }, [dateFrom, dateTo, excludedUsers, retryCount]);
+  }, [dateFrom, dateTo, excludedUsers, clientFilter, retryCount]);
 
   // ── Client-side pivot ────────────────────────────────────────────────────
   const merged = useMemo(() => {
@@ -3453,7 +3456,7 @@ function AdoptionScreen() {
     const url   = URL.createObjectURL(blob);
     const link  = document.createElement('a');
     link.href = url;
-    link.download = `adoption-${axis}-${dateFrom}-${dateTo}.csv`;
+    link.download = `adoption-${axis}-${clientFilter}-${dateFrom}-${dateTo}.csv`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -3531,6 +3534,21 @@ function AdoptionScreen() {
               {lbl}
             </button>
           ))}
+          <div className="h-4 border-l border-gray-200" />
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs text-gray-500">Client</label>
+            <div className="inline-flex rounded-md border border-gray-200 overflow-hidden">
+              {[['uniware', 'Uniware'], ['unireco', 'Unireco'], ['all', 'All']].map(([val, lbl], i) => (
+                <button key={val}
+                  onClick={() => { setClientFilter(val); setChips([]); setAxis('tenant'); }}
+                  className={`px-2.5 py-1 text-xs font-medium transition-colors ${i > 0 ? 'border-l border-gray-200' : ''} ${
+                    clientFilter === val ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-50'
+                  }`}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
         {/* Excluded users */}
         <div className="flex items-center gap-2 flex-wrap">
