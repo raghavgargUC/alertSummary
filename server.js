@@ -1477,6 +1477,12 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
       { activityType: 'RECOMMENDATION', action: 'UNDO',
         'key_data.recommendationId': 'ui_csv_download' },
       { activityType: 'GET_ALL_ALERTS', action: 'FETCH' },
+      { activityType: 'VIEWED',   action: 'VIEW' },
+      { activityType: 'VIEWED',   action: 'POP_UP_VIEW' },
+      { activityType: 'VIEWED',   action: 'BTN_CLICKED' },
+      { activityType: 'ESCALATE', action: 'COPY' },
+      { activityType: 'ESCALATE', action: 'WHATSAPP' },
+      { activityType: 'ESCALATE', action: 'MAIL' },
     ],
   };
   if (excludedUsers.length > 0) baseMatch.userEmail = { $nin: excludedUsers };
@@ -1505,6 +1511,12 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'RESOLVE'] }] }, then: 3 },
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'UNDO'] }, { $eq: ['$key_data.recommendationId', 'ui_csv_download'] }] }, then: 5 },
           { case: { $and: [{ $eq: ['$activityType', 'RECOMMENDATION'] }, { $eq: ['$action', 'UNDO']    }] }, then: 4 },
+          { case: { $and: [{ $eq: ['$activityType', 'VIEWED']   }, { $eq: ['$action', 'VIEW']        }] }, then: 6  },
+          { case: { $and: [{ $eq: ['$activityType', 'VIEWED']   }, { $eq: ['$action', 'POP_UP_VIEW'] }] }, then: 7  },
+          { case: { $and: [{ $eq: ['$activityType', 'VIEWED']   }, { $eq: ['$action', 'BTN_CLICKED'] }] }, then: 8  },
+          { case: { $and: [{ $eq: ['$activityType', 'ESCALATE'] }, { $eq: ['$action', 'COPY']        }] }, then: 9  },
+          { case: { $and: [{ $eq: ['$activityType', 'ESCALATE'] }, { $eq: ['$action', 'WHATSAPP']    }] }, then: 10 },
+          { case: { $and: [{ $eq: ['$activityType', 'ESCALATE'] }, { $eq: ['$action', 'MAIL']        }] }, then: 11 },
         ],
         default: 0,
       } },
@@ -1575,6 +1587,170 @@ app.get('/api/adoption/activity', asyncRoute('/api/adoption/activity', async (re
   ]);
 
   res.json({ tenants, facilities, signals, users, rows: actRows });
+}));
+
+/**
+ * GET /api/adoption/rec-clicks?from=YYYY-MM-DD&to=YYYY-MM-DD&excludedUsers=a,b
+ *
+ * Returns one row per (signal, actionId) for every recommendation-related action:
+ *   RECOMMENDATION/UNDO + coPilot flag  → rec click (actionId = key_data.recommendationId)
+ *   RECOMMENDATION/UNDO + csv download  → csv download (actionId = 'ui_csv_download')
+ *   RECOMMENDATION/RESOLVE              → resolved (actionId = key_data.recommendationId or '')
+ *   ESCALATE/COPY                       → share via copy link (actionId = 'COPY')
+ *   ESCALATE/WHATSAPP                   → share via WhatsApp (actionId = 'WHATSAPP')
+ *   ESCALATE/MAIL                       → share via email (actionId = 'MAIL')
+ *
+ * Each row includes count, distinctUsers, distinctTenants, plus three
+ * breakdown arrays for drill-down:
+ *   tenantBreakdown   [{tenantCode, count, distinctUsers}]
+ *   facilityBreakdown [{tenantCode, facilityCode, count, distinctUsers}]
+ *   userBreakdown     [{userEmail, tenantCode, count}]
+ */
+app.get('/api/adoption/rec-clicks', asyncRoute('/api/adoption/rec-clicks', async (req, res) => {
+  const { fromDate, toDate } = parseAdoptionDateRange(req.query.from, req.query.to);
+  const excludedUsers = parseExcludedUsers(req.query.excludedUsers);
+  const clientCond = clientMatchExpr(parseClient(req.query.client));
+
+  const baseMatch = {
+    timestamp:  { $gte: fromDate, $lt: toDate },
+    tenantCode: { $nin: INTERNAL_TENANTS },
+    $or: [
+      { activityType: 'RECOMMENDATION', action: { $in: ['UNDO', 'RESOLVE'] } },
+      { activityType: 'ESCALATE',       action: { $in: ['COPY', 'WHATSAPP', 'MAIL'] } },
+    ],
+  };
+  if (excludedUsers.length > 0) baseMatch.userEmail = { $nin: excludedUsers };
+  if (clientCond) baseMatch.$and = [clientCond];
+
+  // Canonical action ID for each event type.
+  // ESCALATE: composite "CHANNEL::recommendationId" so the UI can show e.g. "Copy Link · Start Picking"
+  const actionIdExpr = { $switch: {
+    branches: [
+      { case: { $eq: ['$activityType', 'ESCALATE'] },
+        then: { $concat: ['$action', '::', { $ifNull: ['$key_data.recommendationId', ''] }] } },
+    ],
+    default: { $ifNull: ['$key_data.recommendationId', ''] },
+  } };
+
+  const facetResult = await db.collection('alert_user_activity').aggregate([
+    { $match: baseMatch },
+    // Resolve signal name via alertId → alert_overview → signals_master
+    { $addFields: { alertOid: { $convert: { input: '$alertId', to: 'objectId', onError: null } } } },
+    { $lookup: { from: 'alert_overview', localField: 'alertOid', foreignField: '_id', as: '_alert' } },
+    { $addFields: { _alertDoc: { $arrayElemAt: ['$_alert', 0] } } },
+    { $addFields: { signalOid: { $convert: { input: '$_alertDoc.signalId', to: 'objectId', onError: null } } } },
+    { $lookup: { from: 'signals_master', localField: 'signalOid', foreignField: '_id', as: '_signal' } },
+    { $addFields: {
+      _signalName: { $ifNull: [{ $arrayElemAt: ['$_signal.name', 0] }, '(unknown)'] },
+      _actionId:   actionIdExpr,
+    } },
+    { $facet: {
+      // Global totals per (signal, action)
+      totals: [
+        { $group: {
+          _id:     { signalName: '$_signalName', actionId: '$_actionId' },
+          count:   { $sum: 1 },
+          users:   { $addToSet: '$userEmail' },
+          tenants: { $addToSet: '$tenantCode' },
+        } },
+        { $project: {
+          _id: 0,
+          signalName:      '$_id.signalName',
+          actionId:        '$_id.actionId',
+          count:           1,
+          distinctUsers:   { $size: '$users' },
+          distinctTenants: { $size: '$tenants' },
+        } },
+        { $sort: { count: -1 } },
+        { $limit: 500 },
+      ],
+      // Per-tenant breakdown per (signal, action)
+      byTenant: [
+        { $group: {
+          _id:   { signalName: '$_signalName', actionId: '$_actionId', tenantCode: '$tenantCode' },
+          count: { $sum: 1 },
+          users: { $addToSet: '$userEmail' },
+        } },
+        { $project: {
+          _id: 0,
+          signalName: '$_id.signalName',
+          actionId:   '$_id.actionId',
+          tenantCode: '$_id.tenantCode',
+          count:      1,
+          distinctUsers: { $size: '$users' },
+        } },
+        { $sort: { count: -1 } },
+      ],
+      // Per-facility breakdown per (signal, action) — keep tenantCode for context
+      byFacility: [
+        { $group: {
+          _id:   { signalName: '$_signalName', actionId: '$_actionId', tenantCode: '$tenantCode', facilityCode: '$facilityCode' },
+          count: { $sum: 1 },
+          users: { $addToSet: '$userEmail' },
+        } },
+        { $project: {
+          _id: 0,
+          signalName:   '$_id.signalName',
+          actionId:     '$_id.actionId',
+          tenantCode:   '$_id.tenantCode',
+          facilityCode: '$_id.facilityCode',
+          count:        1,
+          distinctUsers: { $size: '$users' },
+        } },
+        { $sort: { count: -1 } },
+        { $limit: 2000 },
+      ],
+      // Per-user breakdown per (signal, action)
+      byUser: [
+        { $group: {
+          _id:   { signalName: '$_signalName', actionId: '$_actionId', userEmail: '$userEmail', tenantCode: '$tenantCode' },
+          count: { $sum: 1 },
+        } },
+        { $project: {
+          _id: 0,
+          signalName: '$_id.signalName',
+          actionId:   '$_id.actionId',
+          userEmail:  '$_id.userEmail',
+          tenantCode: '$_id.tenantCode',
+          count:      1,
+        } },
+        { $sort: { count: -1 } },
+        { $limit: 2000 },
+      ],
+    } },
+  ], { allowDiskUse: true }).toArray();
+
+  const { totals = [], byTenant = [], byFacility = [], byUser = [] } = facetResult[0] || {};
+
+  // Build per-(signal, action) breakdown maps for tenant / facility / user drill-down
+  const tenantMap   = new Map();
+  const facilityMap = new Map();
+  const userMap     = new Map();
+  const push = (map, key, val) => {
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(val);
+  };
+  for (const r of byTenant) {
+    push(tenantMap, `${r.signalName}::${r.actionId}`, { tenantCode: r.tenantCode, count: r.count, distinctUsers: r.distinctUsers });
+  }
+  for (const r of byFacility) {
+    push(facilityMap, `${r.signalName}::${r.actionId}`, { tenantCode: r.tenantCode, facilityCode: r.facilityCode, count: r.count, distinctUsers: r.distinctUsers });
+  }
+  for (const r of byUser) {
+    push(userMap, `${r.signalName}::${r.actionId}`, { userEmail: r.userEmail, tenantCode: r.tenantCode, count: r.count });
+  }
+
+  const data = totals.map((r) => {
+    const key = `${r.signalName}::${r.actionId}`;
+    return {
+      ...r,
+      tenantBreakdown:   tenantMap.get(key)   || [],
+      facilityBreakdown: facilityMap.get(key) || [],
+      userBreakdown:     userMap.get(key)     || [],
+    };
+  });
+
+  res.json({ data });
 }));
 
 // ═════════════════════════════════════════════════════════════════════════════

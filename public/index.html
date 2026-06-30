@@ -1935,20 +1935,33 @@ function SignalDetailScreen({ signal, onBack, onSelectCustomer }) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /** Headline number tile used by Impact + Customer drilldowns. */
-function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200', tip }) {
-  const [tipPos, setTipPos] = React.useState(null);
+function KpiTile({ label, value, sub, accent = '#0f172a', tone = 'bg-white border-gray-200', tip, breakdown }) {
+  const [tipPos,    setTipPos]    = React.useState(null);
+  const [breakOpen, setBreakOpen] = React.useState(false);
   return (
     <div
-      className={`rounded-xl border ${tone} px-4 py-3 shadow-sm relative`}
+      className={`rounded-xl border ${tone} px-4 py-3 shadow-sm relative ${breakdown ? 'cursor-pointer select-none' : ''}`}
+      onClick={breakdown ? () => setBreakOpen((v) => !v) : undefined}
       onMouseEnter={tip ? (e) => { const r = e.currentTarget.getBoundingClientRect(); setTipPos({ x: r.left + r.width / 2, y: r.bottom + 6 }); } : undefined}
       onMouseLeave={tip ? () => setTipPos(null) : undefined}
     >
       <p className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold leading-none flex items-center gap-1">
         {label}
+        {breakdown && <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-violet-100 text-violet-500 text-[9px] font-bold leading-none">{breakOpen ? '▲' : '▼'}</span>}
         {tip && <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-gray-200 text-gray-500 text-[9px] font-bold leading-none cursor-default select-none">?</span>}
       </p>
       <p className="text-3xl font-black tabular-nums tracking-tight mt-2" style={{ color: accent }}>{value}</p>
       {sub && <p className="text-xs text-gray-400 mt-1 leading-snug">{sub}</p>}
+      {breakdown && breakOpen && (
+        <div className="mt-2 pt-2 border-t border-gray-100 space-y-1">
+          {breakdown.map(([lbl, cnt]) => (
+            <div key={lbl} className="flex justify-between items-center">
+              <span className="text-[11px] text-gray-500">{lbl}</span>
+              <span className="text-[11px] font-semibold tabular-nums" style={{ color: accent }}>{(cnt || 0).toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {tip && tipPos && ReactDOM.createPortal(
         <div style={{ position: 'fixed', left: tipPos.x, top: tipPos.y, transform: 'translateX(-50%)', zIndex: 9999, maxWidth: 280, pointerEvents: 'none' }}
           className="bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl leading-relaxed">
@@ -3081,6 +3094,10 @@ function FeedbacksScreen() {
 function todayIST() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 }
+function nDaysAgoIST(n) {
+  const d = new Date(); d.setDate(d.getDate() - n);
+  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
 
 /**
  * Merge dimension arrays from the /fired and /activity endpoints into
@@ -3168,21 +3185,42 @@ function applyAdoptionChips(rows, chips, merged, hasUserDim) {
 
 function computeAdoptionKPIs(filtFired, filtAct, filtTotalAlerts) {
   let fired = 0, opens = 0, recClicks = 0, totalAlerts = 0;
+  let totalViews = 0, viewView = 0, viewPopup = 0, viewBtn = 0;
+  let resolves = 0, totalEscalated = 0, escalCopy = 0, escalWa = 0, escalMail = 0;
+  let csvDownloads = 0;
   const openUserSet  = new Set();
   const engUserSet   = new Set();
   const reachUserSet = new Set();
+  const viewUserSet  = new Set();
+  const csvUserSet   = new Set();
 
   for (const r of filtFired) fired += r[4];
   for (const r of filtTotalAlerts) totalAlerts += r[3];
   for (const r of filtAct) {
     const [,,,, stage, uIdx, cnt] = r;
-    if (stage === 1) { opens += cnt;     if (uIdx >= 0) openUserSet.add(uIdx); }
-    if (stage === 2) {                   if (uIdx >= 0) reachUserSet.add(uIdx); }
-    if (stage === 4)   recClicks += cnt;
+    if (stage === 1) { opens += cnt;        if (uIdx >= 0) openUserSet.add(uIdx); }
+    if (stage === 2) {                       if (uIdx >= 0) reachUserSet.add(uIdx); }
+    if (stage === 4)   recClicks  += cnt;
+    if (stage === 5) { csvDownloads += cnt; if (uIdx >= 0) csvUserSet.add(uIdx); }
+    if (stage === 3)   resolves   += cnt;
+    if (stage === 6) { totalViews += cnt; viewView  += cnt; if (uIdx >= 0) viewUserSet.add(uIdx); }
+    if (stage === 7) { totalViews += cnt; viewPopup += cnt; if (uIdx >= 0) viewUserSet.add(uIdx); }
+    if (stage === 8) { totalViews += cnt; viewBtn   += cnt; if (uIdx >= 0) viewUserSet.add(uIdx); }
+    if (stage === 9)  { totalEscalated += cnt; escalCopy  += cnt; }
+    if (stage === 10) { totalEscalated += cnt; escalWa    += cnt; }
+    if (stage === 11) { totalEscalated += cnt; escalMail  += cnt; }
     if (uIdx >= 0)     engUserSet.add(uIdx);
   }
 
-  return { fired, opens, openedBy: openUserSet.size, recClicks, totalAlerts, engagedUsers: engUserSet.size, reachUsers: reachUserSet.size };
+  return {
+    fired, opens, openedBy: openUserSet.size, recClicks, totalAlerts,
+    engagedUsers: engUserSet.size, reachUsers: reachUserSet.size,
+    csvDownloads, csvDownloadedBy: csvUserSet.size,
+    totalViews, viewedBy: viewUserSet.size,
+    viewBreakdown: [['List View', viewView], ['Popup View', viewPopup], ['Btn Click', viewBtn]],
+    resolves, totalEscalated,
+    escalateBreakdown: { copy: escalCopy, whatsapp: escalWa, mail: escalMail },
+  };
 }
 
 function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotalAlerts) {
@@ -3190,7 +3228,12 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
   const grouped = new Map(); // key → bucket
 
   const ensure = (key) => {
-    if (!grouped.has(key)) grouped.set(key, { fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), recClicks: 0, reachUsers: new Set(), parentTenants: new Set(), csvDownloads: 0, csvUsers: new Set() });
+    if (!grouped.has(key)) grouped.set(key, {
+      fired: 0, totalAlerts: 0, opens: 0, openUsers: new Set(), recClicks: 0,
+      reachUsers: new Set(), parentTenants: new Set(), csvDownloads: 0, csvUsers: new Set(),
+      views: 0, viewView: 0, viewPopup: 0, viewBtn: 0, viewUsers: new Set(),
+      resolves: 0, escalated: 0, escalCopy: 0, escalWa: 0, escalMail: 0,
+    });
     return grouped.get(key);
   };
 
@@ -3203,12 +3246,23 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       if (stage === 1) { g.opens += cnt; g.openUsers.add(uIdx); }
       if (stage === 4) g.recClicks += cnt;
       if (stage === 5) { g.csvDownloads += cnt; g.csvUsers.add(uIdx); }
+      if (stage === 3)  g.resolves   += cnt;
+      if (stage === 6) { g.views += cnt; g.viewView  += cnt; g.viewUsers.add(uIdx); }
+      if (stage === 7) { g.views += cnt; g.viewPopup += cnt; g.viewUsers.add(uIdx); }
+      if (stage === 8) { g.views += cnt; g.viewBtn   += cnt; g.viewUsers.add(uIdx); }
+      if (stage === 9)  { g.escalated += cnt; g.escalCopy += cnt; }
+      if (stage === 10) { g.escalated += cnt; g.escalWa   += cnt; }
+      if (stage === 11) { g.escalated += cnt; g.escalMail += cnt; }
     }
     return [...grouped.entries()].map(([idx, g]) => ({
       key: idx, name: merged.users[idx] || '?', label: merged.users[idx] || '?',
       fired: null, totalAlerts: null, reachUsers: null, opens: g.opens, openedBy: g.openUsers.size,
       recClicks: g.recClicks, opensTotalAlerts: null,
       csvDownloads: g.csvDownloads, csvDownloadedBy: g.csvUsers.size,
+      views: g.views, viewedBy: g.viewUsers.size,
+      viewBreakdown: [['List View', g.viewView], ['Popup View', g.viewPopup], ['Btn Click', g.viewBtn]],
+      resolves: g.resolves, escalated: g.escalated,
+      escalateBreakdown: { copy: g.escalCopy, whatsapp: g.escalWa, mail: g.escalMail },
     }));
   }
 
@@ -3237,6 +3291,13 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
     if (stage === 2) { if (r[5] >= 0) g.reachUsers.add(r[5]); }
     if (stage === 4) g.recClicks += cnt;
     if (stage === 5) { g.csvDownloads += cnt; if (r[5] >= 0) g.csvUsers.add(r[5]); }
+    if (stage === 3)  g.resolves   += cnt;
+    if (stage === 6) { g.views += cnt; g.viewView  += cnt; if (r[5] >= 0) g.viewUsers.add(r[5]); }
+    if (stage === 7) { g.views += cnt; g.viewPopup += cnt; if (r[5] >= 0) g.viewUsers.add(r[5]); }
+    if (stage === 8) { g.views += cnt; g.viewBtn   += cnt; if (r[5] >= 0) g.viewUsers.add(r[5]); }
+    if (stage === 9)  { g.escalated += cnt; g.escalCopy += cnt; }
+    if (stage === 10) { g.escalated += cnt; g.escalWa   += cnt; }
+    if (stage === 11) { g.escalated += cnt; g.escalMail += cnt; }
     if (axis === 'facility') g.parentTenants.add(r[0]);
   }
 
@@ -3261,6 +3322,10 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       fired: g.fired, totalAlerts: g.totalAlerts, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
       recClicks: g.recClicks, opensTotalAlerts,
       csvDownloads: g.csvDownloads, csvDownloadedBy: g.csvUsers.size,
+      views: g.views, viewedBy: g.viewUsers.size,
+      viewBreakdown: [['List View', g.viewView], ['Popup View', g.viewPopup], ['Btn Click', g.viewBtn]],
+      resolves: g.resolves, escalated: g.escalated,
+      escalateBreakdown: { copy: g.escalCopy, whatsapp: g.escalWa, mail: g.escalMail },
     };
   });
 }
@@ -3297,7 +3362,7 @@ function AdoptionTrendChart({ trendData }) {
       data: {
         labels: trendData.labels,
         datasets: [
-          { type: 'bar',  label: 'Fired',       data: trendData.fired,     backgroundColor: 'rgba(107,114,128,0.2)', borderColor: '#9ca3af', borderWidth: 1, borderRadius: 2, yAxisID: 'y',  order: 2 },
+          { type: 'bar',  label: 'Total Alerts', data: trendData.fired,     backgroundColor: 'rgba(99,102,241,0.15)', borderColor: '#6366f1', borderWidth: 1, borderRadius: 2, yAxisID: 'y',  order: 2 },
           { type: 'line', label: 'Opens',        data: trendData.opens,     borderColor: '#3b82f6', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
           { type: 'line', label: 'Rec. Clicks',  data: trendData.recClicks, borderColor: '#f59e0b', backgroundColor: 'transparent', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1', order: 1 },
         ],
@@ -3308,7 +3373,7 @@ function AdoptionTrendChart({ trendData }) {
         plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 10 } } } },
         scales: {
           x:  { ticks: { font: { size: 10 } }, grid: { display: false } },
-          y:  { type: 'linear', position: 'left',  beginAtZero: true, title: { display: true, text: 'Fired', font: { size: 9 } }, grid: { color: '#f3f4f6' } },
+          y:  { type: 'linear', position: 'left',  beginAtZero: true, title: { display: true, text: 'Total Alerts', font: { size: 9 } }, grid: { color: '#f3f4f6' } },
           y1: { type: 'linear', position: 'right', beginAtZero: true, title: { display: true, text: 'Opens / Clicks', font: { size: 9 } }, grid: { drawOnChartArea: false } },
         },
       },
@@ -3320,8 +3385,239 @@ function AdoptionTrendChart({ trendData }) {
 
 // ── Main AdoptionScreen ──────────────────────────────────────────────────────
 
+// Tidy tabbed drill-down shown when an action row is expanded.
+// Switches between Tenant / Facility / User breakdowns of a single action.
+function RecDrillPanel({ row, axis, onAxis }) {
+  const CAP = 50;
+  const tabs = [
+    { key: 'tenant',   label: 'Tenant',   n: (row.tenantBreakdown   || []).length },
+    { key: 'facility', label: 'Facility', n: (row.facilityBreakdown || []).length },
+    { key: 'user',     label: 'User',     n: (row.userBreakdown     || []).length },
+  ];
+
+  let list;
+  if (axis === 'facility') {
+    list = (row.facilityBreakdown || []).map((t) => ({
+      id: `${t.tenantCode}/${t.facilityCode}`, label: t.facilityCode || '—', sub: t.tenantCode,
+      count: t.count ?? 0, users: t.distinctUsers ?? 0,
+    }));
+  } else if (axis === 'user') {
+    list = (row.userBreakdown || []).map((t) => ({
+      id: t.userEmail || '(unknown)', label: t.userEmail || '(unknown)', sub: t.tenantCode,
+      count: t.count ?? 0, users: null,
+    }));
+  } else {
+    list = (row.tenantBreakdown || []).map((t) => ({
+      id: t.tenantCode, label: t.tenantCode, sub: null,
+      count: t.count ?? 0, users: t.distinctUsers ?? 0,
+    }));
+  }
+  list = [...list].sort((a, b) => b.count - a.count);
+
+  const max       = list.reduce((m, x) => Math.max(m, x.count), 0) || 1;
+  const shown     = list.slice(0, CAP);
+  const more      = list.length - shown.length;
+  const showUsers = axis !== 'user';
+  const headLabel = axis === 'facility' ? 'Facility' : axis === 'user' ? 'User' : 'Tenant';
+  const moreNoun  = axis === 'user' ? 'users' : axis === 'facility' ? 'facilities' : 'tenants';
+  const subThCls  = 'px-3 py-1.5 text-right text-[10px] uppercase tracking-wide font-semibold text-indigo-400 whitespace-nowrap';
+
+  return (
+    <div>
+      {/* Axis tabs */}
+      <div className="flex items-center gap-1 px-3 py-2 border-b border-indigo-50 bg-indigo-50/40">
+        {tabs.map((t) => (
+          <button key={t.key} onClick={() => onAxis(t.key)}
+            className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-colors ${
+              axis === t.key ? 'bg-indigo-600 text-white' : 'text-indigo-600 hover:bg-indigo-100'
+            }`}>
+            {t.label}
+            <span className={`ml-1 ${axis === t.key ? 'text-indigo-200' : 'text-indigo-300'}`}>{t.n}</span>
+          </button>
+        ))}
+      </div>
+
+      {list.length === 0 ? (
+        <p className="px-3 py-3 text-xs text-gray-400 text-center">No {axis} data for this action.</p>
+      ) : (
+        <table className="w-full">
+          <thead>
+            <tr className="border-b border-indigo-50">
+              <th className="px-3 py-1.5 text-left text-[10px] uppercase tracking-wide font-semibold text-indigo-400">{headLabel}</th>
+              <th className="px-3 py-1.5 w-1/3"></th>
+              <th className={subThCls} style={{ color: '#6366f1' }}>Count</th>
+              {showUsers && <th className={subThCls}>Users</th>}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-indigo-50/70">
+            {shown.map((x) => (
+              <tr key={x.id} className="hover:bg-indigo-50/50 transition-colors">
+                <td className="px-3 py-1.5 align-middle">
+                  <span className="text-xs font-mono text-gray-700 break-all">{x.label}</span>
+                  {x.sub && <span className="block text-[10px] font-mono text-gray-400">{x.sub}</span>}
+                </td>
+                <td className="px-3 py-1.5">
+                  <div className="h-1.5 rounded-full bg-indigo-50 overflow-hidden">
+                    <div className="h-full rounded-full" style={{ width: `${Math.max(3, (x.count / max) * 100)}%`, background: '#6366f1' }} />
+                  </div>
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums text-xs font-semibold" style={{ color: '#4f46e5' }}>{x.count.toLocaleString()}</td>
+                {showUsers && <td className="px-3 py-1.5 text-right tabular-nums text-xs text-gray-500">{(x.users ?? 0).toLocaleString()}</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {more > 0 && (
+        <p className="px-3 py-1.5 text-[10px] text-gray-400 text-center border-t border-indigo-50">
+          +{more} more {moreNoun} · use Export CSV for the full list
+        </p>
+      )}
+    </div>
+  );
+}
+
+function RecSignalGroup({ signalName, items, defaultOpen = true }) {
+  const [open,        setOpen]        = React.useState(defaultOpen);
+  const [sortKey,     setSortKey]     = React.useState('count');
+  const [sortDir,     setSortDir]     = React.useState('desc');
+  const [expandedRow, setExpandedRow] = React.useState(null); // actionId of expanded row
+  const [drillAxis,   setDrillAxis]   = React.useState('tenant'); // tenant | facility | user
+
+  const toggleRow = (actionId) => {
+    setExpandedRow((cur) => {
+      const next = cur === actionId ? null : actionId;
+      if (next) setDrillAxis('tenant'); // reset axis each time a row opens
+      return next;
+    });
+  };
+
+  const totalCount = items.reduce((s, r) => s + (r.count ?? 0), 0);
+
+  const sortBy = (key) => {
+    if (sortKey === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir('desc'); }
+  };
+  const sortIcon = (key) => sortKey !== key ? ' ↕' : sortDir === 'asc' ? ' ↑' : ' ↓';
+
+  const sorted = [...items].sort((a, b) => {
+    const av = a[sortKey] ?? 0, bv = b[sortKey] ?? 0;
+    return sortDir === 'asc' ? av - bv : bv - av;
+  });
+
+  const thCls  = 'px-3 py-2 text-right text-[11px] uppercase tracking-wide font-semibold text-gray-500 cursor-pointer select-none hover:text-gray-700 whitespace-nowrap';
+  const tdCls  = 'px-3 py-2.5 text-right tabular-nums text-sm';
+
+  return (
+    <div>
+      {/* Signal group header */}
+      <button
+        className="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
+        onClick={() => setOpen((v) => !v)}>
+        <span className="text-xs font-semibold text-gray-700">{signalName}</span>
+        <span className="flex items-center gap-3">
+          <span className="text-[11px] text-gray-400">{totalCount.toLocaleString()} total actions · {items.length} action types</span>
+          <span className="text-gray-400 text-xs">{open ? '▲' : '▼'}</span>
+        </span>
+      </button>
+
+      {open && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="border-b border-gray-100 bg-gray-50/50">
+              <tr>
+                <th className="px-4 py-2 text-left text-[11px] uppercase tracking-wide font-semibold text-gray-500 whitespace-nowrap">Action</th>
+                <th className={thCls} onClick={() => sortBy('count')}>Count{sortIcon('count')}</th>
+                <th className={thCls} onClick={() => sortBy('distinctUsers')}>Users{sortIcon('distinctUsers')}</th>
+                <th className={thCls} onClick={() => sortBy('distinctTenants')}>Tenants{sortIcon('distinctTenants')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((r) => {
+                const name       = actionLabel(r.actionId);
+                const isKnown    = name !== r.actionId;
+                const isExpanded = expandedRow === r.actionId;
+                return (
+                  <React.Fragment key={r.actionId}>
+                    {/* Action row — click to toggle tenant drill-down */}
+                    <tr
+                      className={`border-t border-gray-100 cursor-pointer transition-colors ${isExpanded ? 'bg-indigo-50' : 'hover:bg-gray-50'}`}
+                      onClick={() => toggleRow(r.actionId)}>
+                      <td className="px-4 py-2.5">
+                        <div className="flex items-center gap-2">
+                          <span className="text-gray-400 text-[10px]">{isExpanded ? '▼' : '▶'}</span>
+                          <div>
+                            <span className="text-sm font-medium text-gray-800">{name}</span>
+                            {isKnown && r.actionId && (
+                              <span className="block text-[10px] font-mono text-gray-400 mt-0.5">{r.actionId}</span>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td className={tdCls + ' font-semibold'} style={{ color: '#4f46e5' }}>{(r.count ?? 0).toLocaleString()}</td>
+                      <td className={tdCls + ' text-gray-600'}>{(r.distinctUsers ?? 0).toLocaleString()}</td>
+                      <td className={tdCls + ' text-gray-600'}>{(r.distinctTenants ?? 0).toLocaleString()}</td>
+                    </tr>
+
+                    {/* Drill-down panel — Tenant / Facility / User tabs */}
+                    {isExpanded && (
+                      <tr className="bg-indigo-50/40">
+                        <td colSpan={4} className="px-0 py-0">
+                          <div className="ml-10 mr-4 my-2 rounded-lg border border-indigo-100 bg-white overflow-hidden">
+                            <RecDrillPanel row={r} axis={drillAxis} onAxis={setDrillAxis} />
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const ACTION_NAMES = {
+  ui_csv_download:                 'CSV Download',
+  COPY:                            'Copy Link',
+  WHATSAPP:                        'WhatsApp',
+  MAIL:                            'Email',
+  act_start_picking:               'Start Picking',
+  act_fastrack_picking:            'Fastrack Picking',
+  act_fastrack_packing:            'Fastrack Packing',
+  act_create_putaway_all:          'Create Putaway for All Items',
+  act_escalate_stalled:            'Escalate Stucked Putaways',
+  act_trigger_cycle_count:         'Start Cycle Count',
+  act_escalate_picker_performance: 'Marked Not Found by Operator',
+  act_escalate_supervisor:         'Escalate To Supervisor',
+  act_train_staff:                 'Train Staff on Return Manifest',
+  act_escalate_inbound:            'Escalate To Inbound Team',
+  act_configure_qc:                'Configure QC Reasons',
+  act_escalate_kitting:            'Escalate To Kitting Team',
+  act_fastrack_putback:            'Fastrack Putback',
+  act_request_other_warehouses:    'Request From Other Warehouses',
+  act_release_b2c:                 'Release From B2C Orders',
+  act_add_inventory:               'Add Inventory',
+};
+const actionLabel = (id) => {
+  if (!id) return id;
+  // ESCALATE composite: "COPY::act_create_putaway_all" → "Copy Link · Create Putaway for All Items"
+  if (id.includes('::')) {
+    const sep = id.indexOf('::');
+    const channel = id.slice(0, sep);
+    const recId   = id.slice(sep + 2);
+    const channelName = ACTION_NAMES[channel] ?? channel;
+    const recName     = recId ? (ACTION_NAMES[recId] ?? recId) : '';
+    return recName ? `${channelName} · ${recName}` : channelName;
+  }
+  return ACTION_NAMES[id] ?? id;
+};
+
 function AdoptionScreen() {
-  const [dateFrom, setDateFrom] = useState('2026-06-01');
+  const [dateFrom, setDateFrom] = useState(() => nDaysAgoIST(7));
   const [dateTo,   setDateTo]   = useState(todayIST);
   const [chips,    setChips]    = useState([]);    // [{axis, value, label}]
   const [axis,     setAxis]     = useState('tenant');
@@ -3336,6 +3632,10 @@ function AdoptionScreen() {
   const [loading,         setLoading]         = useState(true);
   const [error,           setError]           = useState(null);
   const [retryCount,      setRetryCount]      = useState(0);
+  const [recData,         setRecData]         = useState(null);
+  const [recLoading,      setRecLoading]      = useState(false);
+  const [recSearch,       setRecSearch]       = useState('');
+  const [recBulk,         setRecBulk]         = useState({ open: false, key: 0 });
 
   // ── Fetch all three endpoints whenever filters change ───────────────────
   useEffect(() => {
@@ -3358,6 +3658,19 @@ function AdoptionScreen() {
     });
     return () => { cancelled = true; };
   }, [dateFrom, dateTo, excludedUsers, clientFilter, retryCount]);
+
+  // ── Fetch rec-clicks (separate, non-blocking) ────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    setRecLoading(true);
+    const params = new URLSearchParams({ from: dateFrom, to: dateTo });
+    if (excludedUsers.length) params.set('excludedUsers', excludedUsers.join(','));
+    params.set('client', clientFilter);
+    apiFetch(`/api/adoption/rec-clicks?${params}`)
+      .then((d) => { if (!cancelled) { setRecData(d); setRecLoading(false); } })
+      .catch(() => { if (!cancelled) setRecLoading(false); });
+    return () => { cancelled = true; };
+  }, [dateFrom, dateTo, excludedUsers, clientFilter]);
 
   // ── Client-side pivot ────────────────────────────────────────────────────
   const merged = useMemo(() => {
@@ -3440,15 +3753,16 @@ function AdoptionScreen() {
 
   const downloadCsv = () => {
     if (!sortedRows.length || !merged) return;
-    const isUser = axis === 'user';
+    const isUser    = axis === 'user';
+    const noReach   = axis === 'user' || axis === 'signal';
     const headers = [
       axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
-      ...(isUser ? [] : ['Total Alerts', 'Users Reached']),
+      ...(isUser ? [] : noReach ? ['Total Alerts', 'Views'] : ['Total Alerts', 'Views', 'Users Reached']),
       'Opens', 'Opened by', 'Rec. Clicks', 'CSV Download', 'CSV Download by',
     ];
     const dataRows = sortedRows.map((r) => [
       `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
-      ...(isUser ? [] : [r.totalAlerts ?? '', r.reachUsers ?? '']),
+      ...(isUser ? [] : noReach ? [r.totalAlerts ?? '', r.views ?? 0] : [r.totalAlerts ?? '', r.views ?? 0, r.reachUsers ?? '']),
       r.opens, r.openedBy, r.recClicks, r.csvDownloads ?? 0, r.csvDownloadedBy ?? 0,
     ].join(','));
     const csv   = [headers.join(','), ...dataRows].join('\r\n');
@@ -3461,9 +3775,73 @@ function AdoptionScreen() {
     URL.revokeObjectURL(url);
   };
 
+  // ── Recommendation-clicks widget: grouping, summary, search, export ───────
+  const recGroups = useMemo(() => {
+    const rows = recData?.data || [];
+    const m = new Map();
+    for (const r of rows) {
+      const sig = r.signalName || '(unknown signal)';
+      if (!m.has(sig)) m.set(sig, []);
+      m.get(sig).push(r);
+    }
+    return [...m.entries()].map(([signalName, items]) => ({
+      signalName,
+      items,
+      totalCount:    items.reduce((s, r) => s + (r.count ?? 0), 0),
+      distinctUsers: items.reduce((mx, r) => Math.max(mx, r.distinctUsers ?? 0), 0),
+    })).sort((a, b) => b.totalCount - a.totalCount);
+  }, [recData]);
+
+  const recSummary = useMemo(() => ({
+    totalClicks: recGroups.reduce((s, g) => s + g.totalCount, 0),
+    signals:     recGroups.length,
+    actionTypes: recGroups.reduce((s, g) => s + g.items.length, 0),
+  }), [recGroups]);
+
+  const recFiltered = useMemo(() => {
+    const q = recSearch.trim().toLowerCase();
+    if (!q) return recGroups;
+    return recGroups
+      .map((g) => {
+        if (g.signalName.toLowerCase().includes(q)) return g;
+        const items = g.items.filter((r) =>
+          actionLabel(r.actionId).toLowerCase().includes(q) ||
+          (r.actionId || '').toLowerCase().includes(q));
+        return items.length ? { ...g, items } : null;
+      })
+      .filter(Boolean);
+  }, [recGroups, recSearch]);
+
+  const downloadRecCsv = () => {
+    if (!recGroups.length) return;
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const headers = ['Signal', 'Action', 'Action ID', 'Scope', 'Count', 'Distinct Users', 'Distinct Tenants'];
+    const lines = [headers.join(',')];
+    for (const g of recGroups) {
+      const items = [...g.items].sort((a, b) => (b.count ?? 0) - (a.count ?? 0));
+      for (const r of items) {
+        const label = actionLabel(r.actionId);
+        lines.push([esc(g.signalName), esc(label), esc(r.actionId), esc('(all tenants)'),
+          r.count ?? 0, r.distinctUsers ?? 0, r.distinctTenants ?? 0].join(','));
+        for (const t of (r.tenantBreakdown || [])) {
+          lines.push([esc(g.signalName), esc(label), esc(r.actionId), esc(t.tenantCode),
+            t.count ?? 0, t.distinctUsers ?? 0, ''].join(','));
+        }
+      }
+    }
+    const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `rec-clicks-${clientFilter}-${dateFrom}-${dateTo}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const today           = todayIST();
   const showStaleBanner = firedData?.coverageThrough && firedData.coverageThrough < today;
   const isUser          = axis === 'user';
+  const hideReach       = axis === 'user' || axis === 'signal'; // reachUsers is always — at signal/user level
   const sortIcon        = (key) => sortKey !== key ? ' ↕' : sortDir === 'asc' ? ' ↑' : ' ↓';
 
   const thCls = 'px-3 py-2 text-left text-[11px] uppercase tracking-wide font-semibold text-gray-500 cursor-pointer select-none hover:text-gray-700 whitespace-nowrap';
@@ -3481,6 +3859,9 @@ function AdoptionScreen() {
     opensTotalAlerts: 'Opens ÷ Total Alerts × 100%. Uses overlap-based Total Alerts as denominator. Not shown at user level. Source: alert_overview + alert_user_activity.',
     csvDownloads: 'RECOMMENDATION + UNDO events where key_data.recommendationId="ui_csv_download". Total count of CSV download events (every download counted separately). Source: alert_user_activity.',
     csvDownloadedBy: 'Distinct user emails with at least one CSV download in this slice. Source: alert_user_activity.',
+    views: 'Total VIEWED events: list visible (VIEW) + popup opened (POP_UP_VIEW) + button clicked (BTN_CLICKED). Hover to see per-action split. Source: alert_user_activity.',
+    escalated: 'ESCALATE events: recommendation shared via Copy Link, WhatsApp, or Email. Single total; hover to see channel split. Source: alert_user_activity.',
+    resolves: 'RECOMMENDATION / RESOLVE events — user marked a recommendation as resolved. Source: alert_user_activity.',
   };
 
   const [tipState, setTipState] = useState(null); // { x, y, text }
@@ -3496,7 +3877,7 @@ function AdoptionScreen() {
   });
 
   const funnelItems = merged ? [
-    { label: 'Fired',        count: kpis.fired,       color: '#6b7280' },
+    { label: 'Total Alerts', count: kpis.totalAlerts, color: '#6366f1' },
     { label: 'Opened',       count: kpis.opens,       color: '#3b82f6' },
     { label: 'Rec. Clicked', count: kpis.recClicks,   color: '#f59e0b' },
   ] : [];
@@ -3507,7 +3888,7 @@ function AdoptionScreen() {
       {/* Staleness banner */}
       {showStaleBanner && (
         <div className="rounded-lg bg-amber-50 border border-amber-200 px-4 py-2 text-sm text-amber-800">
-          Fired data through <strong>{firedData.coverageThrough}</strong> — today's firing data may not be available yet.
+          Alert data through <strong>{firedData.coverageThrough}</strong> — today's data may not be available yet.
         </div>
       )}
 
@@ -3519,12 +3900,14 @@ function AdoptionScreen() {
             <label className="text-xs text-gray-500">From</label>
             <input type="date" value={dateFrom} max={dateTo}
               onChange={(e) => { setDateFrom(e.target.value); setChips([]); setAxis('tenant'); }}
+              onKeyDown={(e) => e.preventDefault()}
               className="border border-gray-200 rounded px-2 py-1 text-sm" />
           </div>
           <div className="flex items-center gap-1.5">
             <label className="text-xs text-gray-500">To</label>
             <input type="date" value={dateTo} min={dateFrom}
               onChange={(e) => { setDateTo(e.target.value); setChips([]); setAxis('tenant'); }}
+              onKeyDown={(e) => e.preventDefault()}
               className="border border-gray-200 rounded px-2 py-1 text-sm" />
           </div>
           <div className="h-4 border-l border-gray-200" />
@@ -3578,13 +3961,12 @@ function AdoptionScreen() {
       {!loading && !error && merged && (
         <>
           {/* ── KPI cards ───────────────────────────────────────────────── */}
-          <div className="grid grid-cols-5 gap-3">
-            <KpiTile label="Signals Fired"  value={kpis.fired.toLocaleString()}             accent="#374151"
-              tip="Distinct signal instances fired in the window. Dedup key: tenant + facility + signalId + IST date. Source: alert_overview.firedAt." />
+          <div className="grid grid-cols-4 gap-3">
             <KpiTile label="Total Alerts"   value={kpis.totalAlerts.toLocaleString()}        accent="#6366f1"
               tip="Count of alert_overview docs that overlapped the selected date range: firedAt < rangeEnd AND (resolvedAt >= rangeStart OR resolvedAt is null). Includes open/ongoing alerts. Source: alert_overview." />
-            <KpiTile label="Users Reached"  value={kpis.reachUsers.toLocaleString()}         sub="viewed alerts list" accent="#0891b2"
-              tip="Distinct users who opened the alerts list page at least once (GET_ALL_ALERTS / FETCH events). Measures visibility, not engagement. Source: alert_user_activity." />
+            <KpiTile label="Total Views"    value={kpis.totalViews.toLocaleString()}         accent="#7c3aed"
+              tip="VIEWED events: list visible (VIEW) + popup opened (POP_UP_VIEW) + button clicked (BTN_CLICKED). Click tile to see per-action split. Source: alert_user_activity."
+              breakdown={kpis.viewBreakdown} />
             <KpiTile label="Opens"          value={kpis.opens.toLocaleString()}              sub={`by ${kpis.openedBy} users`} accent="#2563eb"
               tip="Count of ANALYSIS + CLICKED events. Every click is counted separately (not deduplicated per user). 'by N users' = distinct user emails with at least one open. Source: alert_user_activity." />
             <KpiTile label="Rec. Clicks"    value={kpis.recClicks.toLocaleString()}          sub="co-pilot button tapped" accent="#d97706"
@@ -3598,8 +3980,8 @@ function AdoptionScreen() {
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Engagement funnel (log scale)</p>
               <div className="space-y-3">
                 {funnelItems.map(({ label, count, color }) => {
-                  const pct = kpis.fired > 0 && count > 0
-                    ? Math.max(3, Math.round((Math.log(count + 1) / Math.log(kpis.fired + 1)) * 100))
+                  const pct = kpis.totalAlerts > 0 && count > 0
+                    ? Math.max(3, Math.round((Math.log(count + 1) / Math.log(kpis.totalAlerts + 1)) * 100))
                     : 0;
                   return (
                     <div key={label}>
@@ -3687,6 +4069,9 @@ function AdoptionScreen() {
                       <th {...thProps('totalAlerts', true)}>Total Alerts{sortIcon('totalAlerts')}</th>
                     )}
                     {!isUser && (
+                      <th {...thProps('views', true)}>Views{sortIcon('views')}</th>
+                    )}
+                    {!hideReach && (
                       <th {...thProps('reachUsers', true)}>Users Reached{sortIcon('reachUsers')}</th>
                     )}
                     <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
@@ -3723,7 +4108,7 @@ function AdoptionScreen() {
                 <tbody className="divide-y divide-gray-100">
                   {sortedRows.length === 0 && (
                     <tr>
-                      <td colSpan={isUser ? 6 : 8} className="px-4 py-10 text-center text-sm text-gray-400">
+                      <td colSpan={isUser ? 6 : hideReach ? 8 : 9} className="px-4 py-10 text-center text-sm text-gray-400">
                         No data for the selected filters and date range.
                       </td>
                     </tr>
@@ -3748,6 +4133,18 @@ function AdoptionScreen() {
                         </td>
                       )}
                       {!isUser && (
+                        <td className={tdCls + ' text-right tabular-nums font-medium cursor-default'} style={{ color: '#7c3aed' }}
+                          onMouseEnter={(e) => {
+                            if (!row.viewBreakdown) return;
+                            const r = e.currentTarget.getBoundingClientRect();
+                            setTipState({ x: r.left + r.width / 2, y: r.bottom + 4,
+                              text: row.viewBreakdown.map(([l, c]) => `${l}: ${(c||0).toLocaleString()}`).join(' · ') });
+                          }}
+                          onMouseLeave={() => setTipState(null)}>
+                          {(row.views ?? 0).toLocaleString()}
+                        </td>
+                      )}
+                      {!hideReach && (
                         <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
                           {row.reachUsers != null ? row.reachUsers.toLocaleString() : '—'}
                         </td>
@@ -3764,6 +4161,84 @@ function AdoptionScreen() {
                 </tbody>
               </table>
             </div>
+          </div>
+
+          {/* ── Recommendation Clicks — by Signal ─────────────────────────── */}
+          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+            {/* Header — mirrors the Drill-down explorer */}
+            <div className="px-4 pt-4 pb-3 border-b border-gray-100">
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <h3 className="text-sm font-bold text-gray-800">Recommendation Clicks — by Signal</h3>
+                  {recGroups.length > 0 && (
+                    <p className="text-xs text-gray-400 mt-0.5">
+                      <span className="font-semibold text-gray-600">{recSummary.totalClicks.toLocaleString()}</span> total actions
+                      {' · '}<span className="font-semibold text-gray-600">{recSummary.signals}</span> signals
+                      {' · '}<span className="font-semibold text-gray-600">{recSummary.actionTypes}</span> action types
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {recLoading && <span className="text-xs text-gray-400">Loading…</span>}
+                  {recGroups.length > 0 && (
+                    <>
+                      <button onClick={() => setRecBulk((p) => ({ open: !p.open, key: p.key + 1 }))}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                        {recBulk.open ? 'Collapse all' : 'Expand all'}
+                      </button>
+                      <button onClick={downloadRecCsv}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                        <svg width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 16 16">
+                          <path d="M8 2v9M4 7l4 4 4-4M2 13h12" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                        Export CSV
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              {/* Search */}
+              {recGroups.length > 0 && (
+                <div className="relative">
+                  <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 16 16">
+                    <circle cx="7" cy="7" r="4.5"/><path d="M11 11l3 3" strokeLinecap="round"/>
+                  </svg>
+                  <input
+                    type="text"
+                    value={recSearch}
+                    onChange={(e) => setRecSearch(e.target.value)}
+                    placeholder="Filter by signal or action…"
+                    className="w-full pl-8 pr-8 py-1.5 text-xs border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300"
+                  />
+                  {recSearch && (
+                    <button onClick={() => setRecSearch('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 leading-none">×</button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {!recData && !recLoading && (
+              <p className="px-4 py-6 text-sm text-gray-400 text-center">No data available.</p>
+            )}
+            {recData && recGroups.length === 0 && (
+              <p className="px-4 py-6 text-sm text-gray-400 text-center">No recommendation clicks in this window.</p>
+            )}
+            {recData && recGroups.length > 0 && recFiltered.length === 0 && (
+              <p className="px-4 py-6 text-sm text-gray-400 text-center">No signals or actions match "{recSearch}".</p>
+            )}
+            {recFiltered.length > 0 && (
+              <div className="divide-y divide-gray-100">
+                {recFiltered.map((g) => (
+                  <RecSignalGroup
+                    key={`${g.signalName}|${recBulk.key}`}
+                    signalName={g.signalName}
+                    items={g.items}
+                    defaultOpen={recBulk.open}
+                  />
+                ))}
+              </div>
+            )}
           </div>
 
           {/* ── How every number works ───────────────────────────────────── */}
@@ -3798,6 +4273,10 @@ function AdoptionScreen() {
               <div>
                 <p className="font-semibold text-gray-800 mb-1">Drill-down chips</p>
                 <p className="text-xs">Click any row name to add it as a filter chip. All KPIs, charts, and the table immediately re-slice to that filter. Chips combine freely. Remove individual chips with × or use "Clear all". The axis auto-advances Tenant → Facility → Signal → User on each click.</p>
+              </div>
+              <div>
+                <p className="font-semibold text-gray-800 mb-1">Recommendation Clicks drill-down</p>
+                <p className="text-xs">In the "Recommendation Clicks — by Signal" widget, expand any action row to open a drill-down panel. Switch between <strong>Tenant</strong>, <strong>Facility</strong>, and <strong>User</strong> tabs to see who performed that action and where. Each tab is sorted by count with an inline bar; the panel shows the top 50 rows — use the widget's Export CSV for the complete list.</p>
               </div>
               <div>
                 <p className="font-semibold text-gray-800 mb-1">Always excluded</p>
