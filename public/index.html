@@ -3260,6 +3260,8 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       recClicks: g.recClicks, opensTotalAlerts: null,
       csvDownloads: g.csvDownloads, csvDownloadedBy: g.csvUsers.size,
       views: g.views, viewedBy: g.viewUsers.size,
+      viewedPct: null,
+      opensPct: g.views > 0 ? parseFloat(((g.opens / g.views) * 100).toFixed(1)) : null,
       viewBreakdown: [['List View', g.viewView], ['Popup View', g.viewPopup], ['Btn Click', g.viewBtn]],
       resolves: g.resolves, escalated: g.escalated,
       escalateBreakdown: { copy: g.escalCopy, whatsapp: g.escalWa, mail: g.escalMail },
@@ -3315,12 +3317,14 @@ function computeAdoptionExplorerRows(axis, filtFired, filtAct, merged, filtTotal
       label = `${rawName} · ${tenantNames}`;
     }
     const opensTotalAlerts = g.totalAlerts > 0 ? parseFloat(((g.opens / g.totalAlerts) * 100).toFixed(1)) : null;
+    const viewedPct        = g.totalAlerts > 0 ? parseFloat(((g.views  / g.totalAlerts) * 100).toFixed(1)) : null;
+    const opensPct         = g.views       > 0 ? parseFloat(((g.opens  / g.views)       * 100).toFixed(1)) : null;
     // reachUsers only meaningful at tenant/facility level; signal has no FETCH attribution
     const reachUsers = axis === 'signal' ? null : g.reachUsers.size;
     return {
       key: idx, name: rawName, label,
       fired: g.fired, totalAlerts: g.totalAlerts, reachUsers, opens: g.opens, openedBy: g.openUsers.size,
-      recClicks: g.recClicks, opensTotalAlerts,
+      recClicks: g.recClicks, opensTotalAlerts, viewedPct, opensPct,
       csvDownloads: g.csvDownloads, csvDownloadedBy: g.csvUsers.size,
       views: g.views, viewedBy: g.viewUsers.size,
       viewBreakdown: [['List View', g.viewView], ['Popup View', g.viewPopup], ['Btn Click', g.viewBtn]],
@@ -3757,13 +3761,21 @@ function AdoptionScreen() {
     const noReach   = axis === 'user' || axis === 'signal';
     const headers = [
       axis === 'tenant' ? 'Tenant' : axis === 'facility' ? 'Facility' : axis === 'signal' ? 'Signal' : 'User',
-      ...(isUser ? [] : noReach ? ['Total Alerts', 'Views'] : ['Total Alerts', 'Views', 'Users Reached']),
-      'Opens', 'Opened by', 'Rec. Clicks', 'CSV Download', 'CSV Download by',
+      ...(isUser
+        ? ['Views']
+        : noReach
+          ? ['Total Alerts', 'Views', 'Viewed %']
+          : ['Total Alerts', 'Views', 'Viewed %', 'Users Reached']),
+      'Opens', 'Opens %', 'Opened by', 'Rec. Clicks', 'CSV Download', 'CSV Download by',
     ];
     const dataRows = sortedRows.map((r) => [
       `"${(r.label || r.name || '').replace(/"/g, '""')}"`,
-      ...(isUser ? [] : noReach ? [r.totalAlerts ?? '', r.views ?? 0] : [r.totalAlerts ?? '', r.views ?? 0, r.reachUsers ?? '']),
-      r.opens, r.openedBy, r.recClicks, r.csvDownloads ?? 0, r.csvDownloadedBy ?? 0,
+      ...(isUser
+        ? [r.views ?? 0]
+        : noReach
+          ? [r.totalAlerts ?? '', r.views ?? 0, r.viewedPct != null ? r.viewedPct.toFixed(1) + '%' : '']
+          : [r.totalAlerts ?? '', r.views ?? 0, r.viewedPct != null ? r.viewedPct.toFixed(1) + '%' : '', r.reachUsers ?? '']),
+      r.opens, r.opensPct != null ? r.opensPct.toFixed(1) + '%' : '', r.openedBy, r.recClicks, r.csvDownloads ?? 0, r.csvDownloadedBy ?? 0,
     ].join(','));
     const csv   = [headers.join(','), ...dataRows].join('\r\n');
     const blob  = new Blob([csv], { type: 'text/csv' });
@@ -3860,6 +3872,8 @@ function AdoptionScreen() {
     csvDownloads: 'RECOMMENDATION + UNDO events where key_data.recommendationId="ui_csv_download". Total count of CSV download events (every download counted separately). Source: alert_user_activity.',
     csvDownloadedBy: 'Distinct user emails with at least one CSV download in this slice. Source: alert_user_activity.',
     views: 'Total VIEWED events: list visible (VIEW) + popup opened (POP_UP_VIEW) + button clicked (BTN_CLICKED). Hover to see per-action split. Source: alert_user_activity.',
+    viewedPct: 'Views ÷ Total Alerts × 100%. How often alerts were viewed relative to the total alerts active in the period. Not shown at user level (no Total Alerts attribution). Source: alert_overview + alert_user_activity.',
+    opensPct: 'Opens ÷ Views × 100%. Of all the times users viewed the alert page, how often did they actually open an alert. Source: alert_user_activity.',
     escalated: 'ESCALATE events: recommendation shared via Copy Link, WhatsApp, or Email. Single total; hover to see channel split. Source: alert_user_activity.',
     resolves: 'RECOMMENDATION / RESOLVE events — user marked a recommendation as resolved. Source: alert_user_activity.',
   };
@@ -4068,13 +4082,15 @@ function AdoptionScreen() {
                     {!isUser && (
                       <th {...thProps('totalAlerts', true)}>Total Alerts{sortIcon('totalAlerts')}</th>
                     )}
+                    <th {...thProps('views', true)}>Views{sortIcon('views')}</th>
                     {!isUser && (
-                      <th {...thProps('views', true)}>Views{sortIcon('views')}</th>
+                      <th {...thProps('viewedPct', true)}>Viewed %{sortIcon('viewedPct')}</th>
                     )}
                     {!hideReach && (
                       <th {...thProps('reachUsers', true)}>Users Reached{sortIcon('reachUsers')}</th>
                     )}
                     <th {...thProps('opens', true)}>Opens{sortIcon('opens')}</th>
+                    <th {...thProps('opensPct', true)}>Opens %{sortIcon('opensPct')}</th>
                     <th {...thProps('openedBy', true)}>Opened by{sortIcon('openedBy')}</th>
                     <th {...thProps('recClicks', true)}>Rec. Clicks{sortIcon('recClicks')}</th>
                     <th {...thProps('csvDownloads', true)}>CSV Download{sortIcon('csvDownloads')}</th>
@@ -4108,7 +4124,7 @@ function AdoptionScreen() {
                 <tbody className="divide-y divide-gray-100">
                   {sortedRows.length === 0 && (
                     <tr>
-                      <td colSpan={isUser ? 6 : hideReach ? 8 : 9} className="px-4 py-10 text-center text-sm text-gray-400">
+                      <td colSpan={isUser ? 8 : hideReach ? 10 : 11} className="px-4 py-10 text-center text-sm text-gray-400">
                         No data for the selected filters and date range.
                       </td>
                     </tr>
@@ -4132,16 +4148,19 @@ function AdoptionScreen() {
                           {row.totalAlerts != null ? row.totalAlerts.toLocaleString() : '—'}
                         </td>
                       )}
+                      <td className={tdCls + ' text-right tabular-nums font-medium cursor-default'} style={{ color: '#7c3aed' }}
+                        onMouseEnter={(e) => {
+                          if (!row.viewBreakdown) return;
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setTipState({ x: r.left + r.width / 2, y: r.bottom + 4,
+                            text: row.viewBreakdown.map(([l, c]) => `${l}: ${(c||0).toLocaleString()}`).join(' · ') });
+                        }}
+                        onMouseLeave={() => setTipState(null)}>
+                        {(row.views ?? 0).toLocaleString()}
+                      </td>
                       {!isUser && (
-                        <td className={tdCls + ' text-right tabular-nums font-medium cursor-default'} style={{ color: '#7c3aed' }}
-                          onMouseEnter={(e) => {
-                            if (!row.viewBreakdown) return;
-                            const r = e.currentTarget.getBoundingClientRect();
-                            setTipState({ x: r.left + r.width / 2, y: r.bottom + 4,
-                              text: row.viewBreakdown.map(([l, c]) => `${l}: ${(c||0).toLocaleString()}`).join(' · ') });
-                          }}
-                          onMouseLeave={() => setTipState(null)}>
-                          {(row.views ?? 0).toLocaleString()}
+                        <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
+                          {row.viewedPct != null ? `${row.viewedPct.toFixed(1)}%` : '—'}
                         </td>
                       )}
                       {!hideReach && (
@@ -4150,6 +4169,9 @@ function AdoptionScreen() {
                         </td>
                       )}
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.opens.toLocaleString()}</td>
+                      <td className={tdCls + ' text-right tabular-nums text-gray-500'}>
+                        {row.opensPct != null ? `${row.opensPct.toFixed(1)}%` : '—'}
+                      </td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-500'}>{row.openedBy}</td>
                       <td className={tdCls + ' text-right tabular-nums text-gray-700'}>{row.recClicks.toLocaleString()}</td>
                       <td className={tdCls + ' text-right tabular-nums font-medium'} style={{ color: '#059669' }}>

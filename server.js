@@ -1627,7 +1627,7 @@ app.get('/api/adoption/rec-clicks', asyncRoute('/api/adoption/rec-clicks', async
   const actionIdExpr = { $switch: {
     branches: [
       { case: { $eq: ['$activityType', 'ESCALATE'] },
-        then: { $concat: ['$action', '::', { $ifNull: ['$key_data.recommendationId', ''] }] } },
+        then: { $concat: ['$action', '::', { $ifNull: ['$key_data.recommendationId', { $ifNull: ['$key_data.actionId', ''] }] }] } },
     ],
     default: { $ifNull: ['$key_data.recommendationId', ''] },
   } };
